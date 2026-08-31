@@ -4,6 +4,12 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.1 变更：
+  - 调整：附件下载改为「浏览器下载」——直接调用系统浏览器打开链接。
+    附件多为招投标平台登录后下载（需会话/鉴权），浏览器可靠可用，
+    比程序直连成功率高；解压完成自动弹出附件面板并附提示
+  - 保留库级 _download_attachment 直连能力（默认不启用 GUI 直连）
+
 v2.0 变更：
   - 新功能：附件链接识别与选择下载。解压时自动解析容器内元数据
     （PBZB.xml 等，含被内部规则跳过写盘的文件）与已交付文本条目，
@@ -11,8 +17,7 @@ v2.0 变更：
     （图纸/清单控制价等：分类 MuLuName、文件名 CADTenderName、URL CADFileName），
     也兜底扫描任意 *CADFile* 变体与 <fileUrl/href/src> URL；&amp; 已解码
   - 新功能：GUI 解压完成后出现「可下载附件」面板——按分类列名、多选、
-    全选；「下载所选」直连下载（浏览器 UA、cookie 会话、成功产出到输出目录）；
-    服务器返回网页（需登录/鉴权）时提示改用「浏览器打开」直接调用系统浏览器
+    全选；「浏览器下载」逐项调用系统浏览器打开链接
   - 新功能：--auto 模式下识别到附件在日志给出摘要（GUI 手动选择下载）
 
 v1.9 变更：
@@ -115,7 +120,7 @@ FORMAT_REGISTRY = os.path.join(APP_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(APP_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(APP_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.0"
+APP_VERSION = "v2.1"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -1244,9 +1249,8 @@ class ExtractTool:
         self.attach_count.pack(side=tk.LEFT, padx=4)
         ttk.Button(attach_row, text="全选",
                    command=lambda: self.attach_list.select_set(0, tk.END)).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(attach_row, text="下载所选", command=self._download_selected).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(attach_row, text="浏览器打开",
-                   command=self._open_attachment).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(attach_row, text="浏览器下载", command=self._download_in_browser).pack(
+            side=tk.RIGHT, padx=2)
         self.attach_list = tk.Listbox(self.attach_card, font=(FONT, 9),
                                       selectmode=tk.EXTENDED, activestyle="none",
                                       bg=CARD, fg=FG, relief="flat", height=4,
@@ -1353,49 +1357,21 @@ class ExtractTool:
             self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
         self.attach_count.config(text=f"（{len(self.attachments)}）")
         self.attach_card.pack(fill=tk.X, pady=(0, 8), before=self.prog_row)
-        self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件，请勾选下载或浏览器打开")
+        self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
+                     "勾选后点击「浏览器下载」将调用系统浏览器打开链接" + (
+                         f"（{len(self.attachments)} 个："
+                         f"{', '.join(a['name'] for a in self.attachments[:5])}" + ("…" if len(self.attachments) > 5 else "") + "）" if self.attachments else ""))
 
-    def _download_selected(self):
-        if not self.attachments:
-            return
+    def _download_in_browser(self):
+        """下载附件：直接调起系统浏览器打开链接（附件多为平台登录后下载，
+        浏览器持有会话/鉴权，比程序直连可靠）。"""
         sel = list(self.attach_list.curselection())
         if not sel:
             messagebox.showinfo("提示", "请先在列表中勾选要下载的附件")
             return
-        if not self.last_output_dir:
-            messagebox.showinfo("提示", "请先解压（输出目录未确定）")
-            return
-        items = [self.attachments[i] for i in sel]
-        self.status_text.set(f"正在下载 {len(items)} 个附件…")
-        q = queue.Queue()
-        self.q = q
-        out_dir = self.last_output_dir
-
-        def worker():
-            ok = fail = 0
-            for a in items:
-                q.put(("log", f"⬇ 开始下载: [{a['category']}] {a['name']}"))
-                try:
-                    path = _download_attachment(a["url"], out_dir, a["name"],
-                                                log=lambda m: q.put(("log", m)))
-                    q.put(("log", f"✅ {a['name']} → {os.path.basename(path)}"))
-                    ok += 1
-                except Exception as e:
-                    q.put(("log", f"✗ {a['name']} 下载失败: {e}（可尝试「浏览器打开」）"))
-                    fail += 1
-            q.put(("attach_done", (ok, fail)))
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.root.after(80, self._poll_queue)
-
-    def _open_attachment(self):
-        sel = list(self.attach_list.curselection())
-        if not sel:
-            messagebox.showinfo("提示", "请先在列表中勾选要打开的附件")
-            return
         for i in sel:
             a = self.attachments[i]
-            self._ui_log(f"🌐 浏览器打开: {a['name']} → {a['url']}")
+            self._ui_log(f"🌐 已调用浏览器打开: [{a['category']}] {a['name']}")
             try:
                 os.startfile(a["url"])
             except Exception as e:
