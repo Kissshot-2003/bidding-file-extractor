@@ -321,6 +321,59 @@ class ChecksumTests(ExtractTestBase):
             self.assertNotIn("bad.pdf", f.read())
 
 
+class AttachmentTests(ExtractTestBase):
+    PBZB = ('<?xml version="1.0" encoding="utf-8"?>'
+            '<XiangMuInfo BiaoDuanMC="测试工程">'
+            '<ZBFileCAD>'
+            '<CADMuLu MuLuName="图纸" Xh="1">'
+            '<CADFile CADFileLx="9" CADFileName="http://114.98.87.113:9016/TPBidder/'
+            'TuZhiDocShow?AttachGuid=aaa&amp;ClientGuid=bbb" CADTenderLx="3" '
+            'CADTenderName="图纸.rar" NO="1"/>'
+            '</CADMuLu>'
+            '<CADMuLu MuLuName="清单控制价" Xh="2">'
+            '<CADFile CADFileLx="9" CADFileName="http://114.98.87.113:9016/TPBidder/'
+            'TuZhiDocShow?AttachGuid=ccc" CADTenderName="预算.rar" NO="1"/>'
+            '</CADMuLu>'
+            '</ZBFileCAD>'
+            '</XiangMuInfo>')
+
+    def test_extract_attachment_xml(self):
+        att = et._extract_attachments(self.PBZB)
+        self.assertEqual(len(att), 2)
+        self.assertEqual(att[0]["category"], "图纸")
+        self.assertEqual(att[0]["name"], "图纸.rar")
+        self.assertNotIn("&amp;", att[0]["url"])  # 实体已解码
+        self.assertEqual(att[1]["category"], "清单控制价")
+
+    def test_extract_attachment_bare_url(self):
+        att = et._extract_attachments('<x><a href="https://example.com/file.rar">下载</a></x>')
+        self.assertEqual(len(att), 1)
+        self.assertEqual(att[0]["url"], "https://example.com/file.rar")
+        self.assertTrue(att[0]["name"])
+
+    def test_extract_attachment_dedup(self):
+        twice = et._extract_attachments(self.PBZB) + et._extract_attachments(self.PBZB)
+        ded = et._dedup_attachments(twice)
+        self.assertEqual(len(ded), 2)
+
+    def test_extract_file_attachments_with_internal_excluded(self):
+        """PBZB.xml 被排除写盘，但仍参与附件识别。"""
+        z = make_zip_bytes([("PBZB.xml", self.PBZB.encode("utf-8")),
+                            ("正文.pdf", self.pdf())])
+        src = write_case(self.tmp, "att.zf",
+                         HDR + "<R><ZBFileContent>" + wrap_b64(z) + "</ZBFileContent></R>")
+        logs = []
+        r = et.extract_file(src, log=logs.append)
+        self.assertEqual(len(r["attachments"]), 2)
+        self.assertNotIn("PBZB.xml", r["files"])  # 仍是内部文件不出盘
+        self.assertTrue(any("跳过内部文件" in m for m in logs))
+        self.assertTrue(any("可下载附件" in m for m in logs))
+
+    def test_safe_filename(self):
+        self.assertEqual(et._safe_filename('a/b\\c:d*e?f"g<h>i|j'), "a_b_c_d_e_f_g_h_i_j")
+        self.assertTrue(len(et._safe_filename("x" * 500)) <= 240)
+
+
 class CorruptEntryTests(ExtractTestBase):
     def test_corrupt_entry_skipped_rest_ok(self):
         """v1.8 回归：单个条目损坏时跳过该条目，其余条目正常解压。"""

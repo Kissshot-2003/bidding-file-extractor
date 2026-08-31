@@ -4,6 +4,17 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.0 变更：
+  - 新功能：附件链接识别与选择下载。解压时自动解析容器内元数据
+    （PBZB.xml 等，含被内部规则跳过写盘的文件）与已交付文本条目，
+    识别 <ZBFileCAD><CADMuLu><CADFile> 风格的可下载文件链接
+    （图纸/清单控制价等：分类 MuLuName、文件名 CADTenderName、URL CADFileName），
+    也兜底扫描任意 *CADFile* 变体与 <fileUrl/href/src> URL；&amp; 已解码
+  - 新功能：GUI 解压完成后出现「可下载附件」面板——按分类列名、多选、
+    全选；「下载所选」直连下载（浏览器 UA、cookie 会话、成功产出到输出目录）；
+    服务器返回网页（需登录/鉴权）时提示改用「浏览器打开」直接调用系统浏览器
+  - 新功能：--auto 模式下识别到附件在日志给出摘要（GUI 手动选择下载）
+
 v1.9 变更：
   - 增强：解压增量校验——每个条目录出时累计 CRC32 并与 zip 原始记录比对，
     不一致（数据损坏/加密密钥或算法错误）即拦截该条目并清理残留，
@@ -104,7 +115,7 @@ FORMAT_REGISTRY = os.path.join(APP_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(APP_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(APP_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v1.9"
+APP_VERSION = "v2.0"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -497,6 +508,121 @@ def _resolve_target(directory, base, used_names, overwrite, log=None):
 
 
 # ============================================================================
+# 附件链接识别：容器内部 XML/JSON 中的可下载文件链接（图纸/清单控制价等）
+# ============================================================================
+# 参与附件解析的文本型条目后缀（内部元数据可能被排除写盘，仍需读取解析）
+ATTACH_TEXT_EXTS = {".xml", ".json", ".txt", ".htm", ".html"}
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _extract_attachments(text):
+    """从容器内文本条目（XML/JSON/TXT）中解析可下载附件列表。
+    优先解析六安/安徽平台风格的 <ZBFileCAD><CADMuLu MuLuName="分类"><CADFile
+    CADTenderName="文件名" CADFileName="http…"/>；其余 *CADFile/CADFile* 变体
+    与任意结构化 URL 属性兜底。返回 [{category, name, url}]（去重保序，URL 解 &amp;）。"""
+    out = []
+    seen = set()
+
+    def add(cat, name, url):
+        if not url or not url.lower().startswith(("http://", "https://")):
+            return
+        url = url.replace("&amp;", "&")
+        if url in seen:
+            return
+        seen.add(url)
+        name = (name or "").strip()
+        if not name:
+            tail = url.split("?")[0].rstrip("/").split("/")[-1]
+            name = tail[:40] or url[:40]
+        out.append({"category": (cat or "").strip() or "附件", "name": name, "url": url})
+
+    try:  # 结构化解析：CADFile 变体尽量覆盖
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(text)
+        for mu in root.iter("CADMuLu"):
+            cat = (mu.get("MuLuName") or "").strip()
+            for cf in mu.iter("CADFile"):
+                add(cat, cf.get("CADTenderName"), cf.get("CADFileName"))
+        for el in root.iter():
+            cl = (el.tag or "").lower()
+            if "cadfile" in cl:
+                add(el.get("MuLuName"), el.get("CADTenderName") or el.get("name"),
+                    el.get("CADFileName") or el.get("fileUrl") or el.get("href"))
+            for attr in ("fileUrl", "DownLoadUrl", "downloadUrl", "href", "src", "Url", "url"):
+                add(None, None, el.get(attr))
+    except Exception:
+        pass
+
+    # 兜底：任意位置裸 URL（含 CDATA / 非属性文本）
+    for m in re.finditer(r"https?://[^\s\"'<>]+", text):
+        add(None, None, m.group(0))
+    return out
+
+
+def _dedup_attachments(raw):
+    """按 (name, url) 去重，保持首次顺序。"""
+    seen, out = set(), []
+    for a in raw:
+        key = (a["name"], a["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
+def _download_attachment(url, target_dir, name, log=None):
+    """尽力直连下载附件到 target_dir。成功返回文件路径。
+    若服务器返回 HTML 页面（需要浏览器会话/鉴权而非文件），抛 ValueError
+    （GUI 捕获后提示用浏览器打开）。"""
+    log = log or (lambda _m: None)
+    from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor
+    from urllib.error import URLError, HTTPError
+    import http.cookiejar
+
+    opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    req = Request(url.replace("&amp;", "&"),
+                  headers={"User-Agent": DEFAULT_UA, "Accept": "*/*",
+                           "Accept-Language": "zh-CN,zh;q=0.9"})
+    resp = opener.open(req, timeout=45)
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    body_head = resp.read(8 if "text/html" in ctype else 32)
+    if "text/html" in ctype:
+        raise ValueError("服务器返回网页（可能需要浏览器会话/身份验证），请用「浏览器打开」")
+
+    fname = _safe_filename(name) or "download"
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, fname)
+    if os.path.exists(target):
+        stem, ext = os.path.splitext(fname)
+        i = 1
+        while os.path.exists(os.path.join(target_dir, f"{stem}({i}){ext}")):
+            i += 1
+        target = os.path.join(target_dir, f"{stem}({i}){ext}")
+
+    total = 0
+    with open(target, "wb") as f:
+        f.write(body_head)
+        total += len(body_head)
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            total += len(chunk)
+    return target
+
+
+def _safe_filename(name):
+    """清洗文件名非法字符。"""
+    name = (name or "").strip()
+    for ch in '\\/:*?"<>|':
+        name = name.replace(ch, "_")
+    return name[:240]
+
+
+# ============================================================================
 # 核心解压逻辑（与 GUI 解耦，可独立测试 / 命令行调用）
 # ============================================================================
 class CancelledError(Exception):
@@ -544,6 +670,8 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
     - output_dir  : 输出根目录；None 则输出到源文件所在目录（子目录名为文件主名）
     - cancel_event: threading.Event，置位后中止解压（抛 CancelledError）
     - make_checksum: 解压后生成 _SHA256SUMS.txt 校验清单（SHA-256 + 原始 CRC32）
+    返回 dict 附加 "attachments"：容器内 XML/JSON 中识别的可下载附件链接列表
+    [{category, name, url}]（跳过写盘的内部元数据文件也会参与识别）。
     大文件内存友好：mmap 定位标签，Base64 分块流式解码到临时文件，
     峰值内存仅数 MB，与输入文件大小基本无关。
     单个 ZIP 条目损坏（读取/写入异常、CRC 校验不符）只跳过该条目并告警，
@@ -626,6 +754,7 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                 total_size = 0
                 used_names = set()
                 entry_meta = []  # [{name, sha256, crc}] 校验记录
+                attachment_raw = []  # 容器内文本条目中的可下载链接
 
                 with zipfile.ZipFile(spool) as zf:
                     for zi in zf.infolist():
@@ -637,8 +766,18 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                         base = os.path.basename(decoded_name)
                         if not base:
                             continue
+                        # 内部文件（如 PBZB.xml）：不写盘，但仍读取文本解析附件链接
                         if base in exclude:
                             log(f"  ⊘ 跳过内部文件: {base}")
+                            ext_name = os.path.splitext(base)[1].lower()
+                            if ext_name in ATTACH_TEXT_EXTS:
+                                try:
+                                    attachment_raw.extend(
+                                        _extract_attachments(zf.read(zi).decode("utf-8", "replace")))
+                                except CancelledError:
+                                    raise
+                                except Exception:
+                                    pass
                             continue
 
                         total_size += zi.file_size
@@ -711,6 +850,13 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                         entry_meta.append({"name": base, "sha256": sha_hex,
                                            "crc": f"{crc & 0xFFFFFFFF:08X}"})
                         extracted.append(os.path.basename(target))
+                        # 交付文件本身若含下载链接（如 xxx 附件指引），也参与识别
+                        if os.path.splitext(base)[1].lower() in ATTACH_TEXT_EXTS:
+                            try:
+                                with open(target, "r", encoding="utf-8", errors="replace") as tf:
+                                    attachment_raw.extend(_extract_attachments(tf.read()))
+                            except Exception:
+                                pass
             finally:
                 spool.close()
         finally:
@@ -740,6 +886,11 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
         learned_ext = ext
         log(f"★ 已学习新格式 .{ext}，下次将自动识别")
 
+    attachments = _dedup_attachments(attachment_raw)
+    if attachments:
+        log(f"  📎 识别到 {len(attachments)} 个可下载附件"
+            + (f"：{', '.join(a['name'] for a in attachments[:5])}" + ("…" if len(attachments) > 5 else "")))
+
     return {
         "dir": extract_dir,
         "files": extracted,
@@ -748,6 +899,7 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
         "skipped_size": skipped_size,
         "hashes": {m["name"]: m["sha256"] for m in entry_meta},
         "checksum_file": checksum_file,
+        "attachments": attachments,
     }
 
 
@@ -766,6 +918,7 @@ def run_batch(files, overwrite=True, log=None, progress=None,
     failed = 0
     cancelled = 0
     learned_list = []
+    attachments = []
     last_dir = None
     total = len(files)
     for idx, fp in enumerate(files):
@@ -786,6 +939,8 @@ def run_batch(files, overwrite=True, log=None, progress=None,
                 log(f"  ⚠ 本次 {r['warnings']} 条告警（详见上方日志）")
             if r["learned_ext"]:
                 learned_list.append(r["learned_ext"])
+            if r.get("attachments"):
+                attachments.extend(r["attachments"])
             last_dir = r["dir"]
             success += 1
         except CancelledError:
@@ -798,7 +953,8 @@ def run_batch(files, overwrite=True, log=None, progress=None,
             failed += 1
     progress(total, total, "")
     return {"success": success, "failed": failed, "cancelled": cancelled,
-            "learned": learned_list, "last_dir": last_dir}
+            "learned": learned_list, "last_dir": last_dir,
+            "attachments": attachments}
 
 
 # ============================================================================
@@ -981,6 +1137,7 @@ class ExtractTool:
         self.last_output_dir = None
         self.q = None
         self.cancel_event = threading.Event()
+        self.attachments = []
         self.registry, self.learned = _load_registry()
 
         cfg = _load_ui_config()
@@ -1077,9 +1234,32 @@ class ExtractTool:
         ttk.Checkbutton(act, text="完成后打开输出目录",
                         variable=self.open_dir_var).pack(side=tk.RIGHT, padx=6)
 
+        # ---- 附件下载面板（解压完成后识别出链接时显示）----
+        self.attach_card = tk.Frame(main, background=CARD, highlightthickness=1,
+                                    highlightbackground=BORDER, highlightcolor=ACCENT)
+        attach_row = ttk.Frame(self.attach_card)
+        attach_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Label(attach_row, text="可下载附件", style="Section.TLabel").pack(side=tk.LEFT)
+        self.attach_count = ttk.Label(attach_row, text="（0）", style="Muted.TLabel")
+        self.attach_count.pack(side=tk.LEFT, padx=4)
+        ttk.Button(attach_row, text="全选",
+                   command=lambda: self.attach_list.select_set(0, tk.END)).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(attach_row, text="下载所选", command=self._download_selected).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(attach_row, text="浏览器打开",
+                   command=self._open_attachment).pack(side=tk.RIGHT, padx=2)
+        self.attach_list = tk.Listbox(self.attach_card, font=(FONT, 9),
+                                      selectmode=tk.EXTENDED, activestyle="none",
+                                      bg=CARD, fg=FG, relief="flat", height=4,
+                                      highlightthickness=0,
+                                      selectbackground=SELECT_BG, selectforeground=FG)
+        self.attach_list.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.attach_card.pack(fill=tk.X, pady=(0, 8))
+        self.attach_card.pack_forget()
+
         # ---- 进度行 ----
         prog_row = ttk.Frame(main)
         prog_row.pack(fill=tk.X, pady=(0, 10))
+        self.prog_row = prog_row
         self.progress_var = tk.DoubleVar()
         self.progress = ttk.Progressbar(prog_row, variable=self.progress_var,
                                         style="Accent.Horizontal.TProgressbar",
@@ -1165,6 +1345,61 @@ class ExtractTool:
 
     def _clear_log(self):
         self.log_text.delete(1.0, tk.END)
+
+    # ---- 附件下载面板 ----
+    def _populate_attachments(self):
+        self.attach_list.delete(0, tk.END)
+        for a in self.attachments:
+            self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
+        self.attach_count.config(text=f"（{len(self.attachments)}）")
+        self.attach_card.pack(fill=tk.X, pady=(0, 8), before=self.prog_row)
+        self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件，请勾选下载或浏览器打开")
+
+    def _download_selected(self):
+        if not self.attachments:
+            return
+        sel = list(self.attach_list.curselection())
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中勾选要下载的附件")
+            return
+        if not self.last_output_dir:
+            messagebox.showinfo("提示", "请先解压（输出目录未确定）")
+            return
+        items = [self.attachments[i] for i in sel]
+        self.status_text.set(f"正在下载 {len(items)} 个附件…")
+        q = queue.Queue()
+        self.q = q
+        out_dir = self.last_output_dir
+
+        def worker():
+            ok = fail = 0
+            for a in items:
+                q.put(("log", f"⬇ 开始下载: [{a['category']}] {a['name']}"))
+                try:
+                    path = _download_attachment(a["url"], out_dir, a["name"],
+                                                log=lambda m: q.put(("log", m)))
+                    q.put(("log", f"✅ {a['name']} → {os.path.basename(path)}"))
+                    ok += 1
+                except Exception as e:
+                    q.put(("log", f"✗ {a['name']} 下载失败: {e}（可尝试「浏览器打开」）"))
+                    fail += 1
+            q.put(("attach_done", (ok, fail)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(80, self._poll_queue)
+
+    def _open_attachment(self):
+        sel = list(self.attach_list.curselection())
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中勾选要打开的附件")
+            return
+        for i in sel:
+            a = self.attachments[i]
+            self._ui_log(f"🌐 浏览器打开: {a['name']} → {a['url']}")
+            try:
+                os.startfile(a["url"])
+            except Exception as e:
+                self._ui_log(f"✗ 打开失败: {e}")
 
     def _open_selected_folder(self, _event=None):
         sel = self.file_listbox.curselection()
@@ -1285,6 +1520,13 @@ class ExtractTool:
                 elif kind == "done":
                     self._finish(payload)
                     return
+                elif kind == "attach_done":
+                    ok, fail = payload
+                    self.status_text.set(f"下载完成: 成功 {ok}, 失败 {fail}")
+                    self._ui_log(f"\n下载完成: 成功 {ok}, 失败 {fail}")
+                    self.q = None
+                    messagebox.showinfo("附件下载", f"成功: {ok}, 失败: {fail}\n失败项可在日志中查看原因")
+                    return
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
@@ -1306,6 +1548,9 @@ class ExtractTool:
             self._ui_log(f"\n全部完成! 成功: {success}, 失败: {failed}")
         if learned_list:
             self._ui_log(f"★ 新学习格式: {', '.join('.' + x for x in learned_list)}")
+        self.attachments = list(summary.get("attachments", []))
+        if self.attachments:
+            self._populate_attachments()
 
         if cancelled:
             messagebox.showinfo("完成", f"已取消: 成功 {success}, 失败 {failed}, 取消 {cancelled}")
