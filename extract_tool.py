@@ -4,6 +4,13 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.2 变更：
+  - 布局：可下载附件栏移到「待解压文件」右侧独立一栏（左右分栏），
+    不再横插在进度/日志之间遮挡信息流；附件列表与按钮随栏常驻
+  - 增强：解压完成弹窗明确提示「成功 N 个文件 + 附件数 + 输出目录」
+    （此前仅状态栏/日志提示，容易漏看）；完成后打开输出目录仍可勾选
+  - GUI 窗口扩为 920x640（左右分栏需要更宽）
+
 v2.1 变更：
   - 调整：附件下载改为「浏览器下载」——直接调用系统浏览器打开链接。
     附件多为招投标平台登录后下载（需会话/鉴权），浏览器可靠可用，
@@ -120,7 +127,7 @@ FORMAT_REGISTRY = os.path.join(APP_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(APP_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(APP_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -1134,8 +1141,8 @@ class ExtractTool:
     def __init__(self):
         self.root = make_root()
         self.root.title(f"招标文件快速解压工具 {APP_VERSION}")
-        self.root.geometry("780x560")
-        self.root.minsize(660, 460)
+        self.root.geometry("920x640")
+        self.root.minsize(760, 520)
         self.root.configure(background=BG)
         self.files = []
         self.is_running = False
@@ -1182,8 +1189,15 @@ class ExtractTool:
         main = ttk.Frame(self.root, padding=(14, 12))
         main.pack(fill=tk.BOTH, expand=True)
 
+        # 左右分栏：左列（待解压文件+操作+日志），右栏（可下载附件）
+        body = ttk.Frame(main)
+        body.pack(fill=tk.BOTH, expand=True)
+        left_col = ttk.Frame(body)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.body = body
+
         # 文件区标题 + 计数徽标
-        head_row = ttk.Frame(main)
+        head_row = ttk.Frame(left_col)
         head_row.pack(fill=tk.X)
         dnd_hint = "，可直接把文件拖进窗口" if TkinterDnD is not None else ""
         self.count_label = ttk.Label(head_row, text="待解压文件（0）", style="Section.TLabel")
@@ -1192,7 +1206,7 @@ class ExtractTool:
                   style="Muted.TLabel").pack(side=tk.LEFT, padx=10)
 
         # 文件列表卡片
-        list_card = tk.Frame(main, background=CARD, highlightthickness=1,
+        list_card = tk.Frame(left_col, background=CARD, highlightthickness=1,
                              highlightbackground=BORDER, highlightcolor=ACCENT)
         list_card.pack(fill=tk.BOTH, expand=True, pady=(6, 10))
         list_content = tk.Frame(list_card, background=CARD)
@@ -1216,7 +1230,7 @@ class ExtractTool:
         self.hint_label.place(relx=0.5, rely=0.42, anchor="center")
 
         # ---- 操作按钮行 1：文件管理 ----
-        ops = ttk.Frame(main)
+        ops = ttk.Frame(left_col)
         ops.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(ops, text="选择文件", command=self._add_files).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(ops, text="选择文件夹", command=self._add_folder).pack(side=tk.LEFT, padx=6)
@@ -1224,7 +1238,7 @@ class ExtractTool:
         ttk.Button(ops, text="清空列表", command=self._clear_list).pack(side=tk.LEFT, padx=6)
 
         # ---- 操作按钮行 2：主按钮 + 选项 ----
-        act = ttk.Frame(main)
+        act = ttk.Frame(left_col)
         act.pack(fill=tk.X, pady=(0, 12))
         self.btn_extract = ttk.Button(act, text="开始解压",
                                       style="Primary.TButton", command=self._start_extract)
@@ -1239,29 +1253,35 @@ class ExtractTool:
         ttk.Checkbutton(act, text="完成后打开输出目录",
                         variable=self.open_dir_var).pack(side=tk.RIGHT, padx=6)
 
-        # ---- 附件下载面板（解压完成后识别出链接时显示）----
-        self.attach_card = tk.Frame(main, background=CARD, highlightthickness=1,
-                                    highlightbackground=BORDER, highlightcolor=ACCENT)
+        # ---- 右栏：可下载附件（解压完成后识别出链接时显示）----
+        self.attach_card = tk.Frame(body, background=CARD, width=300,
+                                    highlightthickness=1, highlightbackground=BORDER,
+                                    highlightcolor=ACCENT)
+        self.attach_card.pack_propagate(False)
         attach_row = ttk.Frame(self.attach_card)
-        attach_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+        attach_row.pack(fill=tk.X, padx=8, pady=(8, 2))
         ttk.Label(attach_row, text="可下载附件", style="Section.TLabel").pack(side=tk.LEFT)
         self.attach_count = ttk.Label(attach_row, text="（0）", style="Muted.TLabel")
         self.attach_count.pack(side=tk.LEFT, padx=4)
+        ttk.Button(attach_row, text="浏览器下载",
+                   command=self._download_in_browser).pack(side=tk.RIGHT, padx=2)
         ttk.Button(attach_row, text="全选",
                    command=lambda: self.attach_list.select_set(0, tk.END)).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(attach_row, text="浏览器下载", command=self._download_in_browser).pack(
-            side=tk.RIGHT, padx=2)
         self.attach_list = tk.Listbox(self.attach_card, font=(FONT, 9),
                                       selectmode=tk.EXTENDED, activestyle="none",
-                                      bg=CARD, fg=FG, relief="flat", height=4,
+                                      bg=CARD, fg=FG, relief="flat",
                                       highlightthickness=0,
                                       selectbackground=SELECT_BG, selectforeground=FG)
-        self.attach_list.pack(fill=tk.X, padx=8, pady=(0, 6))
-        self.attach_card.pack(fill=tk.X, pady=(0, 8))
+        self.attach_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 4))
+        attach_hint = tk.Label(self.attach_card, text="解压后识别到的图纸/清单\n控制价等下载链接将出现在此栏",
+                               bg=CARD, fg=MUTED, font=(FONT, 9), justify="center")
+        attach_hint.pack(padx=8, pady=(0, 8))
+        self.attach_hint = attach_hint
+        self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self.attach_card.pack_forget()
 
         # ---- 进度行 ----
-        prog_row = ttk.Frame(main)
+        prog_row = ttk.Frame(left_col)
         prog_row.pack(fill=tk.X, pady=(0, 10))
         self.prog_row = prog_row
         self.progress_var = tk.DoubleVar()
@@ -1274,12 +1294,12 @@ class ExtractTool:
                   width=6).pack(side=tk.LEFT, anchor="e", padx=(8, 2))
 
         # ---- 日志区 ----
-        log_head = ttk.Frame(main)
+        log_head = ttk.Frame(left_col)
         log_head.pack(fill=tk.X)
         ttk.Label(log_head, text="解压日志", style="Section.TLabel").pack(side=tk.LEFT)
         ttk.Button(log_head, text="清空日志",
                    command=self._clear_log).pack(side=tk.RIGHT)
-        log_card = tk.Frame(main, background="#FAFBFC", highlightthickness=1,
+        log_card = tk.Frame(left_col, background="#FAFBFC", highlightthickness=1,
                             highlightbackground=BORDER, highlightcolor=ACCENT)
         log_card.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
 
@@ -1356,7 +1376,8 @@ class ExtractTool:
         for a in self.attachments:
             self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
         self.attach_count.config(text=f"（{len(self.attachments)}）")
-        self.attach_card.pack(fill=tk.X, pady=(0, 8), before=self.prog_row)
+        self.attach_hint.pack_forget()
+        self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
                      "勾选后点击「浏览器下载」将调用系统浏览器打开链接" + (
                          f"（{len(self.attachments)} 个："
@@ -1532,11 +1553,19 @@ class ExtractTool:
             messagebox.showinfo("完成", f"已取消: 成功 {success}, 失败 {failed}, 取消 {cancelled}")
         elif failed > 0:
             messagebox.showwarning("完成", f"成功: {success}, 失败: {failed}\n详情请查看日志")
-        elif success > 0 and self.open_dir_var.get() and self.last_output_dir:
-            try:
-                os.startfile(self.last_output_dir)
-            except Exception:
-                pass
+        elif success > 0:
+            parts = [f"成功解压 {success} 个文件"]
+            if self.attachments:
+                parts.append(f"识别到 {len(self.attachments)} 个可下载附件，"
+                             + "已列在右侧「可下载附件」栏，勾选后点「浏览器下载」")
+            if self.last_output_dir:
+                parts.append(f"输出目录:\n{self.last_output_dir}")
+            messagebox.showinfo("解压完成", "\n".join(parts))
+            if self.open_dir_var.get() and self.last_output_dir:
+                try:
+                    os.startfile(self.last_output_dir)
+                except Exception:
+                    pass
 
         self.is_running = False
         self.q = None
