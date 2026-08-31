@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime outputs
+extract_error.log
+extract_error.log.old
+ui_config.json
+_SHA256SUMS.txt
+
+# Binaries
+*.exe
+
+# Virtual environments
+.venv/
+venv/
+
+# OS junk
+Thumbs.db
+.DS_Store
