@@ -4,6 +4,12 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.3 变更：
+  - 多项目归属：批量解压多个招标文件时，附件按「项目分组」在右栏展示
+    （分隔行=项目名，附件行带分类名），每个附件记录其归属项目与输出目录，
+    浏览器下载只打开所选项目自己的链接，杜绝下错位置
+  - 右栏标题显示「N 个附件 · M 项目」；解压与下载日志均带 [项目 | 分类]
+
 v2.2 变更：
   - 布局：可下载附件栏移到「待解压文件」右侧独立一栏（左右分栏），
     不再横插在进度/日志之间遮挡信息流；附件列表与按钮随栏常驻
@@ -127,7 +133,7 @@ FORMAT_REGISTRY = os.path.join(APP_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(APP_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(APP_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.2"
+APP_VERSION = "v2.3"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -952,7 +958,12 @@ def run_batch(files, overwrite=True, log=None, progress=None,
             if r["learned_ext"]:
                 learned_list.append(r["learned_ext"])
             if r.get("attachments"):
-                attachments.extend(r["attachments"])
+                stem = os.path.splitext(name)[0]
+                for a in r["attachments"]:
+                    aa = dict(a)
+                    aa["project"] = a.get("project") or stem  # 归属项目=源文件名主体
+                    aa["out_dir"] = a.get("out_dir") or r["dir"]
+                    attachments.append(aa)
             last_dir = r["dir"]
             success += 1
         except CancelledError:
@@ -1150,6 +1161,7 @@ class ExtractTool:
         self.q = None
         self.cancel_event = threading.Event()
         self.attachments = []
+        self.attach_map = []
         self.registry, self.learned = _load_registry()
 
         cfg = _load_ui_config()
@@ -1373,9 +1385,22 @@ class ExtractTool:
     # ---- 附件下载面板 ----
     def _populate_attachments(self):
         self.attach_list.delete(0, tk.END)
-        for a in self.attachments:
-            self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
-        self.attach_count.config(text=f"（{len(self.attachments)}）")
+        self.attach_map = []          # listbox 行号 → attachments 索引（分隔行为 None）
+        projects = []
+        for a in self.attachments:    # 保持项目出现顺序
+            if a.get("project") not in projects:
+                projects.append(a["project"])
+        for pj in projects:
+            self.attach_map.append(None)
+            self.attach_list.insert(tk.END, "─ " + pj + " ─")
+            self.attach_list.itemconfig(tk.END, foreground=MUTED)
+            for idx, a in enumerate(self.attachments):
+                if a.get("project") == pj:
+                    self.attach_map.append(idx)
+                    self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
+        n_proj = len(projects)
+        suffix = f" · {n_proj} 项目" if n_proj > 1 else ""
+        self.attach_count.config(text=f"（{len(self.attachments)} 个{suffix}）")
         self.attach_hint.pack_forget()
         self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
@@ -1385,14 +1410,17 @@ class ExtractTool:
 
     def _download_in_browser(self):
         """下载附件：直接调起系统浏览器打开链接（附件多为平台登录后下载，
-        浏览器持有会话/鉴权，比程序直连可靠）。"""
-        sel = list(self.attach_list.curselection())
+        浏览器持有会话/鉴权，比程序直连可靠）。按所选附件归属项目打开对应链接。"""
+        sel = [
+            self.attach_map[i] for i in self.attach_list.curselection()
+            if i < len(self.attach_map) and self.attach_map[i] is not None
+        ]
         if not sel:
-            messagebox.showinfo("提示", "请先在列表中勾选要下载的附件")
+            messagebox.showinfo("提示", "请先在列表中勾选要下载的附件（项目分组行不可选）")
             return
-        for i in sel:
-            a = self.attachments[i]
-            self._ui_log(f"🌐 已调用浏览器打开: [{a['category']}] {a['name']}")
+        for idx in sel:
+            a = self.attachments[idx]
+            self._ui_log(f"🌐 已调用浏览器打开: [{a.get('project')} | {a['category']}] {a['name']}")
             try:
                 os.startfile(a["url"])
             except Exception as e:

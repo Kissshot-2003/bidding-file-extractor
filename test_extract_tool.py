@@ -356,6 +356,31 @@ class AttachmentTests(ExtractTestBase):
         ded = et._dedup_attachments(twice)
         self.assertEqual(len(ded), 2)
 
+    def test_run_batch_attachments_tagged_by_project(self):
+        """v2.3：批量解压多个文件时，附件带归属项目与输出目录，防止下错位置。"""
+        z1 = make_zip_bytes([("PBZB.xml", self.PBZB.encode("utf-8")),
+                             ("正文.pdf", self.pdf())])
+        s1 = write_case(self.tmp, "项目A.zf",
+                        HDR + "<R><ZBFileContent>" + wrap_b64(z1) + "</ZBFileContent></R>")
+        z2 = make_zip_bytes([("正文.pdf", self.pdf()), ("附件.txt",
+                                                         b'<x fileUrl="https://d.example.com/b.rar">k</x>')])
+        s2 = write_case(self.tmp, "项目B.cf",
+                        HDR + "<R><DYFileContent>" + wrap_b64(z2) + "</DYFileContent></R>")
+        summ = et.run_batch([s1, s2])
+        att = summ["attachments"]
+        self.assertEqual(len(att), 3)
+        for a in att:
+            self.assertTrue(a.get("project"))
+            self.assertTrue(a.get("out_dir"))
+        proj_a = [a for a in att if a["project"].startswith("项目A")]
+        self.assertEqual(len(proj_a), 2)
+        self.assertEqual(proj_a[0]["name"], "图纸.rar")
+        self.assertIn(os.path.join(self.tmp, "项目A"), proj_a[0]["out_dir"])
+        proj_b = [a for a in att if a["project"].startswith("项目B")]
+        self.assertEqual(len(proj_b), 1)
+        self.assertEqual(proj_b[0]["url"], "https://d.example.com/b.rar")
+        self.assertIn(os.path.join(self.tmp, "项目B"), proj_b[0]["out_dir"])
+
     def test_extract_file_attachments_with_internal_excluded(self):
         """PBZB.xml 被排除写盘，但仍参与附件识别。"""
         z = make_zip_bytes([("PBZB.xml", self.PBZB.encode("utf-8")),
