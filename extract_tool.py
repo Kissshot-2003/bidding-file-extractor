@@ -4,6 +4,15 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.4 变更：
+  - 修复：exe 打包版「格式学习记忆丢失」——onefile 运行时 __file__ 指向
+    临时解包目录 _MEIPASS，导致 format_registry.json 等配置每次写到临时目录、
+    下次启动即丢失（表现为每次解压都在「★ 已学习新格式」）。
+    现改为 exe 所在目录持久化；目录不可写时回退 %APPDATA%\招标文件快速解压工具
+  - decrypt_config.json 打包运行时优先从 exe 目录读取（随包模板），
+    其次配置目录；源码运行时行为不变
+  - 附带：ui_config.json（勾选状态）与错误日志同样落盘配置目录，同源修复
+
 v2.3 变更：
   - 多项目归属：批量解压多个招标文件时，附件按「项目分组」在右栏展示
     （分隔行=项目名，附件行带分类名），每个附件记录其归属项目与输出目录，
@@ -128,12 +137,41 @@ import threading
 from datetime import datetime
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ERROR_LOG = os.path.join(APP_DIR, "extract_error.log")
-FORMAT_REGISTRY = os.path.join(APP_DIR, "format_registry.json")
-DECRYPT_CONFIG = os.path.join(APP_DIR, "decrypt_config.json")
-UI_CONFIG = os.path.join(APP_DIR, "ui_config.json")
+
+
+def _resolve_config_dir():
+    """持久化配置目录（格式注册表/界面状态/错误日志等）：
+    - 源码运行时：源码所在目录（开发机习惯不变）
+    - PyInstaller 打包运行时：exe 所在目录；该目录不可写（如 Program Files）
+      时回退 %APPDATA%\\招标文件快速解压工具——解决 onefile 下 __file__ 指向
+      临时解包目录 _MEIPASS 导致「每次启动都重新学习格式、记忆丢失」的问题。
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        probe = os.path.join(exe_dir, f".writetest_{os.getpid()}")
+        try:
+            with open(probe, "w") as f:
+                f.write("x")
+            os.remove(probe)
+            return exe_dir
+        except Exception:
+            pass
+        ap = os.path.join(os.environ.get("APPDATA", ""), "招标文件快速解压工具")
+        try:
+            os.makedirs(ap, exist_ok=True)
+            return ap
+        except Exception:
+            return exe_dir
+    return APP_DIR
+
+
+CONFIG_DIR = _resolve_config_dir()
+ERROR_LOG = os.path.join(CONFIG_DIR, "extract_error.log")
+FORMAT_REGISTRY = os.path.join(CONFIG_DIR, "format_registry.json")
+DECRYPT_CONFIG = os.path.join(CONFIG_DIR, "decrypt_config.json")
+UI_CONFIG = os.path.join(CONFIG_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.3"
+APP_VERSION = "v2.4"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -413,12 +451,19 @@ def pkcs7_unpad(data):
 # 解密配置与钩子
 # ============================================================================
 def _load_decrypt_config():
-    """读取 decrypt_config.json。返回 (rules_dict, exclude_set)。"""
+    """读取 decrypt_config.json。返回 (rules_dict, exclude_set)。
+    打包运行时先找 exe 目录（随包模板），再找配置目录（回退 APPDATA）。"""
     exclude = set(INTERNAL_FILES)
     rules = {}
+    path = None
+    for cand in (os.path.join(APP_DIR, "decrypt_config.json"),
+                 os.path.join(CONFIG_DIR, "decrypt_config.json")):
+        if os.path.exists(cand):
+            path = cand
+            break
     try:
-        if os.path.exists(DECRYPT_CONFIG):
-            with open(DECRYPT_CONFIG, "r", encoding="utf-8-sig") as f:
+        if path:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
             for x in cfg.get("exclude_files", []):
                 exclude.add(x)
