@@ -509,6 +509,112 @@ class CliHelperTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_build_motrix_deeplink_single(self):
+        link = et._build_motrix_deeplink(["http://114.98.87.113:9016/TPBidder/file.rar"])
+        self.assertTrue(link.startswith("motrix://new-task?uri="))
+        from urllib.parse import unquote, urlparse, parse_qs
+        u = urlparse(link)
+        self.assertEqual(u.hostname, "new-task")
+        qs = parse_qs(u.query)
+        self.assertIn("uri", qs)
+        self.assertEqual(unquote(qs["uri"][0]).strip(),
+                         "http://114.98.87.113:9016/TPBidder/file.rar")
+
+    def test_build_motrix_deeplink_batch(self):
+        urls = ["https://a.example.com/x.zip?k=1&tag=图纸", "https://b.example.com/y.rar"]
+        link = et._build_motrix_deeplink(urls)
+        self.assertTrue(link.startswith("motrix://new-task?uri="))
+        from urllib.parse import unquote, urlparse, parse_qs
+        u = urlparse(link)
+        self.assertEqual(u.hostname, "new-task")
+        decoded = unquote(parse_qs(u.query)["uri"][0])
+        parts = decoded.split("\n")
+        self.assertEqual(parts, urls)  # 换行分隔、顺序一致、& 未被破坏
+        for p in parts:
+            self.assertTrue(p.startswith("http"))  # Motrix fW() 校验开头协议
+
+    def test_build_motrix_deeplink_empty(self):
+        self.assertIsNone(et._build_motrix_deeplink([]))
+        self.assertIsNone(et._build_motrix_deeplink(["", "   "]))
+
+    def test_build_motrix_deeplink_filters_blank(self):
+        link = et._build_motrix_deeplink(["  https://a.example.com/z.zip  ", ""])
+        from urllib.parse import unquote, urlparse, parse_qs
+        decoded = unquote(parse_qs(urlparse(link).query)["uri"][0])
+        self.assertEqual(decoded, "https://a.example.com/z.zip")
+
+    def test_motrix_protocol_available(self):
+        # 真实环境：安装了 Motrix 则为 True；无论如何不抛异常
+        result = et._motrix_protocol_available()
+        self.assertIsInstance(result, bool)
+
+    def test_fmt_size_and_speed(self):
+        self.assertEqual(et._fmt_size(0), "0 B")
+        self.assertEqual(et._fmt_size(512), "512 B")
+        self.assertEqual(et._fmt_size(2048), "2.0 KB")
+        self.assertEqual(et._fmt_size(3 * 1024 * 1024), "3.0 MB")
+        self.assertEqual(et._fmt_speed(0), "0 B/s")
+        self.assertEqual(et._fmt_speed(1024 * 1024), "1.0 MB/s")
+
+    def test_motrix_rpc_endpoint_shape(self):
+        # 有 Motrix 配置则返回 (端口, 令牌) 二元组；无配置返回 None；不抛异常
+        endpoint = et._motrix_rpc_endpoint()
+        if endpoint is not None:
+            port, secret = endpoint
+            self.assertIsInstance(port, int)
+            self.assertIsInstance(secret, str)
+
+    def test_aria2_rpc_error_raises(self):
+        # 连一个大概率不存在的端口：必须抛异常而不是静默返回
+        with self.assertRaises(Exception):
+            et._aria2_rpc(16999, "", "aria2.getVersion", timeout=1)
+
+    def test_looks_like_html(self):
+        self.assertTrue(et._looks_like_html(b"<!DOCTYPE html><html>", None))
+        self.assertTrue(et._looks_like_html(b"\xef\xbb\xbf<html lang=\"zh\">", "text/plain"))
+        self.assertTrue(et._looks_like_html(b"xxx", "text/html; charset=utf-8"))
+        self.assertFalse(et._looks_like_html(b"Rar!\x1a\x07\x01\x00", "application/octet-stream"))
+        self.assertFalse(et._looks_like_html(b"", "application/json"))
+
+    def test_epoint_action_url(self):
+        page = ("http://220.179.5.14:90/TPBidder/netztbmis/pages/signature/TuZhiDocShow"
+                "?AttachGuid=A1&ClientGuid=B2")
+        action = et._epoint_action_url(page)
+        self.assertEqual(action,
+                         "http://220.179.5.14:90/TPBidder/netztbmis/pages/signature/TuZhiDocShowAction.action"
+                         "?AttachGuid=A1&ClientGuid=B2")
+        # 已是 .action / 无路径 / 带扩展名的路径不处理
+        self.assertIsNone(et._epoint_action_url(page.replace("TuZhiDocShow", "TuZhiDocShowAction.action")))
+        self.assertIsNone(et._epoint_action_url("http://x.com/file.rar?k=1"))
+
+    def test_parse_epoint_server_file_path(self):
+        raw = json.dumps({"controls": [], "custom": {
+            "msg": "", "serverFilePath": "http://x/TuZhiDownloadAttachment.action?cmd=download&AttachGuid=A1"}})
+        sp, msg = et._parse_epoint_server_file_path(raw)
+        self.assertEqual(sp, "http://x/TuZhiDownloadAttachment.action?cmd=download&AttachGuid=A1")
+        self.assertEqual(msg, "")
+        sp2, msg2 = et._parse_epoint_server_file_path("not json")
+        self.assertIsNone(sp2)
+        self.assertIsNone(msg2)
+        sp3, msg3 = et._parse_epoint_server_file_path(json.dumps({"custom": {"msg": "链接已过期"}}))
+        self.assertIsNone(sp3)
+        self.assertEqual(msg3, "链接已过期")
+
+    def test_sniff_html_file(self):
+        tmp = tempfile.mkdtemp(prefix="sniff_")
+        try:
+            hp = os.path.join(tmp, "a.rar")
+            with open(hp, "wb") as f:
+                f.write(b"<!DOCTYPE html><html><body>err</body></html>")
+            self.assertTrue(et._sniff_html_file(hp))
+            bp = os.path.join(tmp, "b.rar")
+            with open(bp, "wb") as f:
+                f.write(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 64)
+            self.assertFalse(et._sniff_html_file(bp))
+            self.assertFalse(et._sniff_html_file(os.path.join(tmp, "missing.rar")))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

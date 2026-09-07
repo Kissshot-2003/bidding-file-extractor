@@ -4,6 +4,37 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.7 变更：
+  - 修复：部分平台附件链接（如 epoint/新点 TuZhiDocShow 图纸查看页）是
+    HTML 页面而非文件——此前直接提交 Motrix 会"成功"下载到 4KB 网页
+    （表现为文件损坏）。现于提交前自动解析：探测响应为 HTML → 请求
+    epoint 同名 Action.action 接口 → 取 JSON 中 custom.serverFilePath
+    真实文件直链（该链路无需登录态），Referer 设为原页面
+  - 增强：下载完成后嗅探文件头，若仍为网页（链接过期/平台拦截）行内
+    明确报错并引导「浏览器」打开，不再产生看似成功的坏文件
+  - 新增 _resolve_attachment_url 解析层与 _looks_like_html /
+    _epoint_action_url / _parse_epoint_server_file_path 可测组件
+
+v2.6 变更：
+  - 新功能：Motrix 无头下载——通过 Motrix 持久化的本地 aria2 RPC 配置
+    （%APPDATA%/Motrix/settings.json 的 rpcPort/rpcSecret）直接 addUri：
+    不弹 Motrix 窗口、任务自动开始，dir=附件归属项目输出目录、out=附件
+    文件名，allow-overwrite 保证「重新下载」可覆盖旧文件
+  - 新功能：附件栏逐行渲染——每行文件名 + 实时进度条 + 速度/进度文本
+  - 新功能：行内按钮「暂停/继续/停止/重新下载/浏览器」，头部「全部下载」
+    一键提交全部附件；Motrix 未运行时自动拉起并轮询引擎就绪（约 30 秒）
+  - 调整：行状态机 idle→starting→active→paused→complete/error/stopped，
+    后台线程 1 秒轮询 tellStatus 经队列回传 UI，界面不卡顿；
+    RPC 不可用时行内显示明确错误，浏览器按钮始终兜底
+
+v2.5 变更：
+  - 调整：附件下载由「浏览器下载」改为「Motrix 下载」——把选中附件的
+    链接批量组装为 motrix:// 深度链接调起 Motrix「新建任务」窗口
+    （每行一条自动预填，确认后开始下载；Motrix 未运行会被系统自动拉起），
+    下载任务统一进 Motrix 队列，多线程/限速/保存目录由 Motrix 管理
+  - 增强：未检测到 motrix:// 协议（未安装 Motrix）时自动回退
+    系统浏览器逐条打开链接，行为与旧版一致
+
 v2.4 变更：
   - 修复：exe 打包版「格式学习记忆丢失」——onefile 运行时 __file__ 指向
     临时解包目录 _MEIPASS，导致 format_registry.json 等配置每次写到临时目录、
@@ -171,7 +202,7 @@ FORMAT_REGISTRY = os.path.join(CONFIG_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(CONFIG_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(CONFIG_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.4"
+APP_VERSION = "v2.7"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -652,7 +683,7 @@ def _download_attachment(url, target_dir, name, log=None):
     ctype = (resp.headers.get("Content-Type") or "").lower()
     body_head = resp.read(8 if "text/html" in ctype else 32)
     if "text/html" in ctype:
-        raise ValueError("服务器返回网页（可能需要浏览器会话/身份验证），请用「浏览器打开」")
+        raise ValueError("服务器返回网页（可能需要浏览器会话/身份验证），请改用 Motrix 或浏览器打开")
 
     fname = _safe_filename(name) or "download"
     os.makedirs(target_dir, exist_ok=True)
@@ -683,6 +714,297 @@ def _safe_filename(name):
     for ch in '\\/:*?"<>|':
         name = name.replace(ch, "_")
     return name[:240]
+
+
+# ---------------------------------------------------------------------------
+# Motrix 下载器集成（motrix:// 深度链接，Motrix 2.x 官方协议格式）
+# ---------------------------------------------------------------------------
+def _motrix_protocol_available():
+    """检测系统是否已注册 motrix:// 协议（安装 Motrix 后自动注册）。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "motrix"):
+            return True
+    except OSError:
+        return False
+
+
+def _build_motrix_deeplink(urls):
+    """把一条或多条下载链接组装为 motrix:// 深度链接。
+
+    Motrix 2.x 协议格式：motrix://new-task?uri=<URL编码后的链接>
+    （uri 须以 http/https/ftp/magnet 开头）；多条链接以换行合并可
+    在 Motrix「新建任务」窗口一次性批量预填（每行一条）。
+    返回深度链接字符串；urls 全为空时返回 None。
+    """
+    from urllib.parse import quote
+    lines = [u.strip() for u in urls if u and u.strip()]
+    if not lines:
+        return None
+    return "motrix://new-task?uri=" + quote("\n".join(lines), safe="")
+
+
+def _fmt_size(n):
+    """字节数 → 人类可读大小（B/KB/MB/GB）。"""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "0 B"
+
+
+def _fmt_speed(speed):
+    """字节数/秒 → 人类可读速度。"""
+    speed = float(speed or 0)
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if speed < 1024 or unit == "GB/s":
+            return ("%d %s" % (speed, unit)) if unit == "B/s" else ("%.1f %s" % (speed, unit))
+        speed /= 1024.0
+    return "0 B/s"
+
+
+def _motrix_rpc_endpoint():
+    """读取 Motrix 本地设置，返回 (rpc端口, rpc令牌)；读取失败返回 None。
+
+    Motrix 2.x 把引擎 RPC 端口与令牌持久化在 %APPDATA%/Motrix/settings.json，
+    与其 aria2 引擎实际启动参数一致，可用于本地 JSON-RPC 无头直控。"""
+    path = os.path.join(os.environ.get("APPDATA", ""), "Motrix", "settings.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        engine = cfg.get("engine") or {}
+        port = int(engine.get("rpcPort") or 16800)
+        secret = str(engine.get("rpcSecret") or "")
+        return port, secret
+    except Exception:
+        return None
+
+
+def _motrix_exe_path():
+    """从系统注册的 motrix:// 协议命令行解析 Motrix.exe 安装路径。"""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"motrix\shell\open\command") as k:
+            cmd = (winreg.QueryValueEx(k, "")[0] or "").strip()
+        if cmd.startswith('"'):
+            return cmd.split('"', 2)[1]
+        return cmd.split(" ", 1)[0]
+    except Exception:
+        return None
+
+
+def _aria2_rpc(port, secret, method, params=None, timeout=6):
+    """调用 Motrix 内置 aria2 的 JSON-RPC。成功返回 result，失败抛异常。
+
+    端点 http://127.0.0.1:<port>/jsonrpc；令牌以 "token:<secret>" 作为
+    第一个参数（secret 为空时不带令牌）。注意 Motrix 定制版 aria2 对
+    JSON-RPC 业务错误（如 GID 不存在）返回 HTTP 400，错误详情在响应体。"""
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "zb-extract-tool",
+        "method": method,
+        "params": (["token:" + secret] if secret else []) + list(params or []),
+    }).encode("utf-8")
+    req = Request("http://127.0.0.1:%d/jsonrpc" % port, data=payload,
+                  headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+    except HTTPError as e:
+        try:
+            data = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            data = None
+        message = (data or {}).get("error", {}).get("message") if data else None
+        raise RuntimeError(message or f"Motrix RPC HTTP {e.code}")
+    data = json.loads(body)
+    if data.get("error"):
+        raise RuntimeError(str((data["error"] or {}).get("message") or "RPC 错误"))
+    return data.get("result")
+
+
+def _motrix_ensure_engine(port, secret, wait_seconds=30, log=None):
+    """确保 Motrix aria2 引擎可用：已在运行直接返回 True；否则拉起
+    Motrix 并轮询 RPC 就绪（默认最长等待 30 秒）。"""
+    import time
+
+    def probe():
+        try:
+            _aria2_rpc(port, secret, "aria2.getVersion", timeout=2)
+            return True
+        except Exception:
+            return False
+
+    if probe():
+        return True
+    exe = _motrix_exe_path()
+    if not exe or not os.path.exists(exe):
+        if log:
+            log("✗ 未找到 Motrix 安装路径（motrix:// 协议未注册），无法自动启动")
+        return False
+    try:
+        import subprocess
+        subprocess.Popen([exe], cwd=os.path.dirname(exe),
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        if log:
+            log("🚀 Motrix 未运行，已自动启动，等待下载引擎就绪…")
+    except Exception as e:
+        if log:
+            log(f"✗ 自动启动 Motrix 失败: {e}")
+        return False
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        time.sleep(0.8)
+        if probe():
+            return True
+    if log:
+        log("✗ 等待 Motrix 下载引擎超时（可在 Motrix 设置中检查 RPC 端口）")
+    return False
+
+
+def _motrix_add_download(url, save_dir, filename, log=None, resume=True, referer=None):
+    """无头添加下载任务到 Motrix（不弹窗、自动开始）。成功返回 aria2 gid。
+
+    本地 RPC addUri：dir=附件归属项目输出目录，out=清洗后的文件名；
+    allow-overwrite 保证可覆盖旧文件；resume=True（首次提交）尝试续传
+    旧的部分文件，resume=False（「重新下载」）强制全新下载——对不支持
+    Range 续传的服务器也能成功；referer 用于平台防盗链校验。"""
+    endpoint = _motrix_rpc_endpoint()
+    if not endpoint:
+        raise RuntimeError("未找到 Motrix 配置（请先启动一次 Motrix）")
+    port, secret = endpoint
+    if not _motrix_ensure_engine(port, secret, log=log):
+        raise RuntimeError("Motrix 下载引擎未就绪（已尝试自动启动 Motrix）")
+    opts = {"dir": save_dir, "out": filename,
+            "user-agent": DEFAULT_UA,
+            "allow-overwrite": "true",
+            "continue": "true" if resume else "false"}
+    if referer:
+        opts["referer"] = referer
+    return str(_aria2_rpc(port, secret, "aria2.addUri", [[url], opts]))
+
+
+def _motrix_task_status(port, secret, gid):
+    """查询 aria2 任务状态，返回简化 dict（原始状态、进度字节、速度、错误）。"""
+    st = _aria2_rpc(port, secret, "aria2.tellStatus",
+                    [gid, ["status", "completedLength", "totalLength",
+                           "downloadSpeed", "errorMessage"]])
+    return {
+        "raw": st.get("status") or "",
+        "done": int(st.get("completedLength") or 0),
+        "total": int(st.get("totalLength") or 0),
+        "speed": int(st.get("downloadSpeed") or 0),
+        "error": (st.get("errorMessage") or "").strip(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 附件链接解析层：把"查看器页面"还原为真实文件直链
+# ---------------------------------------------------------------------------
+def _looks_like_html(head_bytes, content_type):
+    """按 Content-Type 与响应体头部判断是否为 HTML 页面（容忍 UTF-8 BOM）。"""
+    ct = (content_type or "").lower()
+    if "text/html" in ct or "application/xhtml" in ct:
+        return True
+    head = (head_bytes or b"")[:256].lstrip()
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:]
+    lower = head[:15].lower()
+    return lower.startswith(b"<!doctype html") or lower.startswith(b"<html")
+
+
+def _epoint_action_url(url):
+    """epoint/新点 框架查看页 URL → 同名 Action.action 接口（保留查询串）。
+
+    例：.../pages/signature/TuZhiDocShow?AttachGuid=..&ClientGuid=..
+      → .../pages/signature/TuZhiDocShowAction.action?AttachGuid=..&ClientGuid=..
+    非 epoint 页面风格（无路径/已是 .action）返回 None。"""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    path = parts.path or ""
+    if not path or path.endswith(".action") or "." in path.rstrip("/").rsplit("/", 1)[-1]:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, path + "Action.action", parts.query, ""))
+
+
+def _parse_epoint_server_file_path(json_text):
+    """从 epoint Action 响应 JSON 提取 (custom.serverFilePath, custom.msg)。"""
+    try:
+        data = json.loads(json_text)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    custom = data.get("custom") or {}
+    if not isinstance(custom, dict):
+        return None, None
+    return custom.get("serverFilePath"), custom.get("msg")
+
+
+def _sniff_html_file(path):
+    """嗅探本地文件：内容是 HTML 页面（而非二进制附件）时返回 True。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512).lstrip()
+        if head.startswith(b"\xef\xbb\xbf"):
+            head = head[3:]
+        lower = head[:15].lower()
+        return lower.startswith(b"<!doctype html") or lower.startswith(b"<html")
+    except Exception:
+        return False
+
+
+def _resolve_attachment_url(url, log=None):
+    """把附件 URL 解析为可直连下载的文件地址。
+
+    流程：GET 探测响应类型；若为 HTML（epoint/新点 TuZhiDocShow 等查看页），
+    请求同名 Action.action 接口，从 JSON 的 custom.serverFilePath 取真实
+    文件直链（实测该链路无需登录态）；Action 返回 msg（如链接过期）时抛
+    ValueError 带原因；已是文件直链则原样返回。"""
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return url
+    from urllib.request import Request, urlopen
+    try:
+        req = Request(url.replace("&amp;", "&"),
+                      headers={"User-Agent": DEFAULT_UA, "Accept": "*/*"})
+        with urlopen(req, timeout=15) as resp:
+            head = resp.read(2048)
+            ctype = resp.headers.get("Content-Type")
+    except Exception as e:
+        if log:
+            log(f"⚠ 链接预检失败（仍按原链接提交 Motrix）: {e}")
+        return url
+    if not _looks_like_html(head, ctype):
+        return url
+
+    action = _epoint_action_url(url)
+    if not action:
+        raise ValueError("链接返回的是网页而非文件（暂不支持自动解析），请用「浏览器」打开")
+    try:
+        req = Request(action.replace("&amp;", "&"),
+                      headers={"User-Agent": DEFAULT_UA,
+                               "X-Requested-With": "XMLHttpRequest",
+                               "Accept": "application/json, text/javascript, */*",
+                               "Referer": url})
+        with urlopen(req, timeout=15) as resp:
+            body = resp.read(65536).decode("utf-8", "replace")
+    except Exception as e:
+        raise ValueError(f"查看页接口请求失败: {e}")
+    server_file, msg = _parse_epoint_server_file_path(body)
+    if server_file and str(server_file).lower().startswith(("http://", "https://")):
+        if log:
+            log("🔧 已从查看页解析出真实文件直链")
+        return server_file
+    if msg:
+        raise ValueError("平台返回: " + str(msg))
+    raise ValueError("查看页解析失败（未获取到文件地址），请用「浏览器」打开")
 
 
 # ============================================================================
@@ -1206,7 +1528,8 @@ class ExtractTool:
         self.q = None
         self.cancel_event = threading.Event()
         self.attachments = []
-        self.attach_map = []
+        self.attach_rows = {}         # 附件索引 → 行控件与下载状态
+        self.attach_q = queue.Queue() # 后台线程 → UI 的附件状态/日志消息
         self.registry, self.learned = _load_registry()
 
         cfg = _load_ui_config()
@@ -1221,6 +1544,9 @@ class ExtractTool:
         self._register_dnd()
         self._handle_argv()
         self._refresh_list_ui()
+        self.root.after(150, self._poll_attach_queue)
+        threading.Thread(target=self._attach_poller_loop, daemon=True).start()
+        self.root.bind_all("<MouseWheel>", self._attach_mousewheel)
 
     def _build_ui(self):
         # ---- 状态栏（沉底）----
@@ -1310,8 +1636,8 @@ class ExtractTool:
         ttk.Checkbutton(act, text="完成后打开输出目录",
                         variable=self.open_dir_var).pack(side=tk.RIGHT, padx=6)
 
-        # ---- 右栏：可下载附件（解压完成后识别出链接时显示）----
-        self.attach_card = tk.Frame(body, background=CARD, width=300,
+        # ---- 右栏：可下载附件（逐行卡片：文件名+进度条+操作按钮）----
+        self.attach_card = tk.Frame(body, background=CARD, width=400,
                                     highlightthickness=1, highlightbackground=BORDER,
                                     highlightcolor=ACCENT)
         self.attach_card.pack_propagate(False)
@@ -1320,16 +1646,26 @@ class ExtractTool:
         ttk.Label(attach_row, text="可下载附件", style="Section.TLabel").pack(side=tk.LEFT)
         self.attach_count = ttk.Label(attach_row, text="（0）", style="Muted.TLabel")
         self.attach_count.pack(side=tk.LEFT, padx=4)
-        ttk.Button(attach_row, text="浏览器下载",
-                   command=self._download_in_browser).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(attach_row, text="全选",
-                   command=lambda: self.attach_list.select_set(0, tk.END)).pack(side=tk.RIGHT, padx=2)
-        self.attach_list = tk.Listbox(self.attach_card, font=(FONT, 9),
-                                      selectmode=tk.EXTENDED, activestyle="none",
-                                      bg=CARD, fg=FG, relief="flat",
-                                      highlightthickness=0,
-                                      selectbackground=SELECT_BG, selectforeground=FG)
-        self.attach_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 4))
+        ttk.Button(attach_row, text="全部下载",
+                   command=self._download_all_in_motrix).pack(side=tk.RIGHT, padx=2)
+        attach_container = tk.Frame(self.attach_card, background=CARD)
+        attach_container.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 6))
+        self.attach_canvas = tk.Canvas(attach_container, bg=CARD, highlightthickness=0)
+        attach_scroll = ttk.Scrollbar(attach_container, orient=tk.VERTICAL,
+                                      command=self.attach_canvas.yview)
+        self.attach_inner = tk.Frame(self.attach_canvas, background=CARD)
+        self.attach_canvas.create_window((0, 0), window=self.attach_inner,
+                                         anchor="nw", tags="inner")
+        self.attach_inner.bind(
+            "<Configure>",
+            lambda _e: self.attach_canvas.configure(
+                scrollregion=self.attach_canvas.bbox("all")))
+        self.attach_canvas.bind(
+            "<Configure>",
+            lambda e: self.attach_canvas.itemconfigure("inner", width=e.width))
+        self.attach_canvas.configure(yscrollcommand=attach_scroll.set)
+        self.attach_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        attach_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         attach_hint = tk.Label(self.attach_card, text="解压后识别到的图纸/清单\n控制价等下载链接将出现在此栏",
                                bg=CARD, fg=MUTED, font=(FONT, 9), justify="center")
         attach_hint.pack(padx=8, pady=(0, 8))
@@ -1427,49 +1763,394 @@ class ExtractTool:
     def _clear_log(self):
         self.log_text.delete(1.0, tk.END)
 
-    # ---- 附件下载面板 ----
+    # ---- 附件下载面板（Motrix 无头下载：逐行进度 + 暂停/停止/重下/浏览器）----
     def _populate_attachments(self):
-        self.attach_list.delete(0, tk.END)
-        self.attach_map = []          # listbox 行号 → attachments 索引（分隔行为 None）
+        for w in self.attach_inner.winfo_children():
+            w.destroy()
+        self.attach_rows = {}
         projects = []
         for a in self.attachments:    # 保持项目出现顺序
             if a.get("project") not in projects:
                 projects.append(a["project"])
         for pj in projects:
-            self.attach_map.append(None)
-            self.attach_list.insert(tk.END, "─ " + pj + " ─")
-            self.attach_list.itemconfig(tk.END, foreground=MUTED)
+            tk.Label(self.attach_inner, text="─ " + pj + " ─", bg=CARD, fg=MUTED,
+                     font=(FONT, 8), anchor="w").pack(fill=tk.X, padx=2, pady=(8, 2))
             for idx, a in enumerate(self.attachments):
                 if a.get("project") == pj:
-                    self.attach_map.append(idx)
-                    self.attach_list.insert(tk.END, f"[{a['category']}] {a['name']}")
+                    self._build_attach_row(idx)
         n_proj = len(projects)
         suffix = f" · {n_proj} 项目" if n_proj > 1 else ""
         self.attach_count.config(text=f"（{len(self.attachments)} 个{suffix}）")
         self.attach_hint.pack_forget()
         self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
-                     "勾选后点击「浏览器下载」将调用系统浏览器打开链接" + (
-                         f"（{len(self.attachments)} 个："
-                         f"{', '.join(a['name'] for a in self.attachments[:5])}" + ("…" if len(self.attachments) > 5 else "") + "）" if self.attachments else ""))
+                     "点行内「下载」或「全部下载」即无头提交 Motrix（不弹窗、"
+                     "自动开始，文件存入各项目输出目录）；Motrix 未运行会自动启动")
 
-    def _download_in_browser(self):
-        """下载附件：直接调起系统浏览器打开链接（附件多为平台登录后下载，
-        浏览器持有会话/鉴权，比程序直连可靠）。按所选附件归属项目打开对应链接。"""
-        sel = [
-            self.attach_map[i] for i in self.attach_list.curselection()
-            if i < len(self.attach_map) and self.attach_map[i] is not None
-        ]
-        if not sel:
-            messagebox.showinfo("提示", "请先在列表中勾选要下载的附件（项目分组行不可选）")
+    def _build_attach_row(self, idx):
+        a = self.attachments[idx]
+        card = tk.Frame(self.attach_inner, background=CARD)
+        card.pack(fill=tk.X, padx=4, pady=(0, 4))
+        top = tk.Frame(card, background=CARD)
+        top.pack(fill=tk.X)
+        name = f"[{a['category']}] {a['name']}"
+        if len(name) > 34:
+            name = name[:33] + "…"
+        tk.Label(top, text=name, bg=CARD, fg=FG, font=(FONT, 9),
+                 anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        pct_lbl = tk.Label(top, text="", bg=CARD, fg=MUTED, font=(FONT, 8),
+                           anchor="e", width=5)
+        pct_lbl.pack(side=tk.RIGHT)
+        bar = ttk.Progressbar(card, orient=tk.HORIZONTAL, maximum=100, value=0,
+                              style="Accent.Horizontal.TProgressbar")
+        bar.pack(fill=tk.X, pady=(2, 1))
+        stat_lbl = tk.Label(card, text="未下载", bg=CARD, fg=MUTED,
+                            font=(FONT, 8), anchor="w")
+        stat_lbl.pack(fill=tk.X)
+        btns = tk.Frame(card, background=CARD)
+        btns.pack(fill=tk.X, pady=(2, 0))
+        self.attach_rows[idx] = {"card": card, "bar": bar, "pct_lbl": pct_lbl,
+                                 "status_lbl": stat_lbl, "btns": btns,
+                                 "state": "idle", "gid": None, "error": None,
+                                 "status_text": "", "pct": 0.0, "speed": 0}
+        self._render_attach_row(idx)
+
+    def _render_attach_row(self, idx):
+        row = self.attach_rows[idx]
+        pct = row.get("pct", 0.0)
+        row["bar"].configure(value=pct)
+        row["pct_lbl"].configure(text=f"{pct:.0f}%" if pct > 0 else "")
+        st = row["state"]
+        defaults = {"idle": "未下载", "starting": "连接 Motrix 引擎…",
+                    "stopping": "处理中…", "active": "下载中…", "paused": "已暂停",
+                    "waiting": "排队中…", "complete": "✔ 已完成",
+                    "stopped": "已停止", "error": row.get("error") or "下载失败"}
+        text = row.get("status_text") or defaults.get(st, "")
+        color = MUTED
+        if st == "active":
+            color = ACCENT
+        elif st == "complete":
+            color = SUCCESS
+        elif st == "paused":
+            color = WARN
+        elif st == "error":
+            color = DANGER
+        if st == "error" and row.get("error"):
+            err = row["error"]
+            text = "下载失败: " + (err[:60] + "…" if len(err) > 60 else err)
+        row["status_lbl"].configure(text=text, fg=color)
+        self._render_attach_buttons(idx)
+
+    def _render_attach_buttons(self, idx):
+        row = self.attach_rows[idx]
+        for w in row["btns"].winfo_children():
+            w.destroy()
+        st = row["state"]
+
+        def add(text, cmd):
+            ttk.Button(row["btns"], text=text, command=cmd).pack(side=tk.LEFT, padx=(0, 4))
+
+        if st == "idle":
+            add("下载", lambda i=idx: self._attach_start(i))
+        elif st == "starting":
+            ttk.Button(row["btns"], text="提交中…", state=tk.DISABLED).pack(side=tk.LEFT, padx=(0, 4))
+        elif st in ("active", "waiting"):
+            add("暂停", lambda i=idx: self._attach_pause(i))
+            add("停止", lambda i=idx: self._attach_stop(i))
+            add("重新下载", lambda i=idx: self._attach_restart(i))
+        elif st == "paused":
+            add("继续", lambda i=idx: self._attach_resume(i))
+            add("停止", lambda i=idx: self._attach_stop(i))
+            add("重新下载", lambda i=idx: self._attach_restart(i))
+        elif st == "stopping":
+            ttk.Button(row["btns"], text="…", state=tk.DISABLED).pack(side=tk.LEFT, padx=(0, 4))
+        elif st == "complete":
+            add("重新下载", lambda i=idx: self._attach_restart(i))
+        elif st in ("error", "stopped"):
+            add("重新下载", lambda i=idx: self._attach_start(i))
+        add("浏览器", lambda i=idx: self._attach_open_browser(i))
+
+    # ---- 行状态机：UI 线程内更新；后台线程经 attach_q 提交 ----
+    def _set_attach_state(self, idx, state, detail=None, text=None):
+        row = self.attach_rows.get(idx)
+        if not row:
             return
-        for idx in sel:
-            a = self.attachments[idx]
-            self._ui_log(f"🌐 已调用浏览器打开: [{a.get('project')} | {a['category']}] {a['name']}")
+        row["state"] = state
+        if state in ("active", "paused", "waiting") and detail:
+            row["gid"] = detail
+        elif state in ("error", "stopped", "idle"):
+            row["gid"] = None
+            row["error"] = detail
+        if text is not None:
+            row["status_text"] = text
+        self._render_attach_row(idx)
+
+    def _attach_finalize_complete(self, idx):
+        """任务完成收尾：嗅探产物文件头，若为网页（链接过期/平台拦截）判为
+        失败并引导「浏览器」打开，避免产生看似成功的坏文件。"""
+        row = self.attach_rows.get(idx)
+        if not row:
+            return
+        a = self.attachments[idx]
+        ext = os.path.splitext(a["name"])[1].lower()
+        target = os.path.join(a.get("out_dir") or ".",
+                              _safe_filename(a["name"]) or "attachment.bin")
+        if ext not in (".html", ".htm", ".xhtml", ".xml", ".svg") and _sniff_html_file(target):
+            row["state"] = "error"
+            row["gid"] = None
+            row["error"] = "下载内容是网页而非文件（链接可能已过期），请点「浏览器」打开"
+            row["status_text"] = ""
+        else:
+            row["state"] = "complete"
+            row["pct"] = 100.0
+            row["status_text"] = "✔ 已完成"
+        self._render_attach_row(idx)
+
+    def _apply_attach_status(self, idx, st):
+        row = self.attach_rows.get(idx)
+        if not row:
+            return
+        raw = st["raw"]
+        total, done, speed = st["total"], st["done"], st["speed"]
+        row["total"] = total
+        row["done"] = done
+        row["pct"] = (done / total * 100.0) if total > 0 else 0.0
+        row["speed"] = speed
+        if raw == "complete":
+            self._attach_finalize_complete(idx)
+        elif raw == "active":
+            row["state"] = "active"
+            if total > 0:
+                row["status_text"] = f"{_fmt_size(done)} / {_fmt_size(total)} · {_fmt_speed(speed)}"
+            else:
+                row["status_text"] = f"已下载 {_fmt_size(done)} · {_fmt_speed(speed)}"
+        elif raw == "paused":
+            row["state"] = "paused"
+            row["status_text"] = "已暂停"
+        elif raw == "waiting":
+            row["state"] = "waiting"
+            row["status_text"] = "排队中（已达最大并发）"
+        elif raw == "error":
+            row["state"] = "error"
+            row["gid"] = None
+            row["error"] = st["error"] or "服务器拒绝（可能需浏览器登录后下载）"
+            row["status_text"] = ""
+        elif raw == "removed":
+            row["state"] = "stopped"
+            row["gid"] = None
+            row["status_text"] = ""
+        self._render_attach_row(idx)
+
+    # ---- 行操作（UI 线程发起，RPC 在后台线程执行）----
+    def _attach_start(self, idx, resume=True):
+        row = self.attach_rows.get(idx)
+        if not row or row["state"] in ("starting", "active", "paused", "waiting", "stopping"):
+            return
+        a = self.attachments[idx]
+        row["pct"] = 0.0
+        row["speed"] = 0
+        row["total"] = 0
+        row["done"] = 0
+        self._set_attach_state(idx, "starting", text="连接 Motrix 引擎…")
+        self._ui_log(f"📤 提交 Motrix 下载: [{a.get('project')} | {a['category']}] {a['name']}")
+
+        def work():
             try:
-                os.startfile(a["url"])
+                real_url = _resolve_attachment_url(
+                    a["url"], log=lambda m: self.attach_q.put(("log", idx, {"text": m})))
             except Exception as e:
-                self._ui_log(f"✗ 打开失败: {e}")
+                self.attach_q.put(("state", idx,
+                                   {"state": "error", "detail": str(e),
+                                    "text": f"解析失败: {e}"}))
+                return
+            try:
+                gid = _motrix_add_download(
+                    real_url, a.get("out_dir") or ".",
+                    _safe_filename(a["name"]) or "attachment.bin",
+                    log=lambda m: self.attach_q.put(("log", idx, {"text": m})),
+                    resume=resume, referer=a["url"])
+            except Exception as e:
+                self.attach_q.put(("state", idx,
+                                   {"state": "error", "detail": str(e),
+                                    "text": f"提交失败: {e}"}))
+                return
+            self.attach_q.put(("state", idx,
+                               {"state": "active", "detail": gid, "text": ""}))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _attach_rpc(self, idx, method, ok_state, ok_text=None):
+        row = self.attach_rows.get(idx)
+        if not row or not row.get("gid"):
+            return
+        endpoint = _motrix_rpc_endpoint()
+        gid = row["gid"]
+        if not endpoint:
+            self.attach_q.put(("state", idx,
+                               {"state": "error", "detail": "未找到 Motrix 配置",
+                                "text": "操作失败: 未找到 Motrix 配置"}))
+            return
+        port, secret = endpoint
+
+        def work():
+            try:
+                _aria2_rpc(port, secret, "aria2." + method, [gid], timeout=6)
+            except Exception as e:
+                # 失败不硬切状态：轮询会按引擎真实状态纠正（任务可能刚完成）
+                self.attach_q.put(("log", idx, {"text": f"⚠ Motrix 操作({method})失败: {e}"}))
+                return
+            self.attach_q.put(("state", idx,
+                               {"state": ok_state, "text": ok_text or ""}))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _attach_pause(self, idx):
+        row = self.attach_rows.get(idx)
+        if not row or row["state"] != "active":
+            return
+        self._set_attach_state(idx, "stopping", text="暂停中…")
+        self._attach_rpc(idx, "pause", "paused", "已暂停")
+
+    def _attach_resume(self, idx):
+        row = self.attach_rows.get(idx)
+        if not row or row["state"] != "paused":
+            return
+        self._set_attach_state(idx, "stopping", text="继续中…")
+        self._attach_rpc(idx, "unpause", "active")
+
+    def _attach_stop(self, idx):
+        row = self.attach_rows.get(idx)
+        if not row or row["state"] not in ("active", "paused", "waiting"):
+            return
+        self._set_attach_state(idx, "stopping", text="停止中…")
+        self._attach_rpc(idx, "remove", "stopped", "已停止")
+
+    def _attach_restart(self, idx):
+        """重新下载：移除旧任务后强制全新下载（continue=false，不依赖
+        服务器 Range 续传支持，任何服务器都能成功）。"""
+        row = self.attach_rows.get(idx)
+        if not row:
+            return
+        old_gid = row.get("gid")
+        endpoint = _motrix_rpc_endpoint()
+        if old_gid and endpoint:
+            port, secret = endpoint
+
+            def _rm(gid=old_gid):
+                try:
+                    _aria2_rpc(port, secret, "aria2.remove", [gid], timeout=6)
+                except Exception:
+                    pass
+            threading.Thread(target=_rm, daemon=True).start()
+        row["gid"] = None
+        row["state"] = "idle"
+        self._attach_start(idx, resume=False)
+
+    def _attach_open_browser(self, idx):
+        a = self.attachments[idx]
+        self._ui_log(f"🌐 调用浏览器打开: [{a.get('project')} | {a['category']}] {a['name']}")
+        try:
+            os.startfile(a["url"])
+        except Exception as e:
+            self._ui_log(f"✗ 打开失败: {e}")
+
+    def _download_all_in_motrix(self):
+        started = 0
+        for idx in list(self.attach_rows.keys()):
+            if self.attach_rows[idx]["state"] in ("idle", "error", "stopped", "complete"):
+                self._attach_start(idx)
+                started += 1
+        if not started and self.attach_rows:
+            self._ui_log("没有可下载的附件（全部正在下载或处理中）")
+
+    def _attach_mousewheel(self, event):
+        w = getattr(self, "attach_canvas", None)
+        if w is None or not w.winfo_ismapped():
+            return
+        mx, my = w.winfo_pointerx(), w.winfo_pointery()
+        inside = (w.winfo_rootx() <= mx < w.winfo_rootx() + w.winfo_width()
+                  and w.winfo_rooty() <= my < w.winfo_rooty() + w.winfo_height())
+        if inside:
+            w.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def _attach_poller_loop(self):
+        """后台轮询 Motrix 任务状态（1 秒节拍），经 attach_q 交 UI 线程刷新。"""
+        import time
+        while True:
+            try:
+                tracked = [(idx, r) for idx, r in list(self.attach_rows.items())
+                           if r.get("gid") and r["state"] in
+                           ("active", "paused", "waiting", "stopping")]
+                if tracked:
+                    endpoint = _motrix_rpc_endpoint()
+                    if not endpoint:
+                        for idx, _r in tracked:
+                            self.attach_q.put(("state", idx,
+                                               {"state": "error",
+                                                "detail": "未找到 Motrix 配置",
+                                                "text": "未找到 Motrix 配置"}))
+                    else:
+                        port, secret = endpoint
+                        for idx, _r in tracked:
+                            try:
+                                st = _motrix_task_status(port, secret, _r["gid"])
+                            except Exception as e:
+                                msg = str(e)
+                                if "is not found" in msg:
+                                    # 任务记录被 Motrix 清除（SQLite 持久化模式下
+                                    # 完成任务即刻移出 RPC；或引擎已重启）——
+                                    # 交 UI 按目标文件是否落盘判定完成/丢失
+                                    self.attach_q.put(("gone", idx, {}))
+                                else:
+                                    self.attach_q.put(("log", idx,
+                                                       {"text": f"⚠ 进度查询失败: {msg}"}))
+                                continue
+                            self.attach_q.put(("status", idx, st))
+            except Exception:
+                pass  # 轮询线程永不退出，异常下个节拍重来
+            time.sleep(1.0)
+
+    def _apply_attach_gone(self, idx):
+        """GID 在引擎中消失（Motrix SQLite 模式下完成任务/出错任务会被
+        移出 RPC，或引擎重启）：按目标文件落盘大小判定完成/中断/丢失。"""
+        row = self.attach_rows.get(idx)
+        if not row or row["state"] not in ("active", "waiting", "stopping"):
+            return
+        a = self.attachments[idx]
+        target = os.path.join(a.get("out_dir") or ".",
+                              _safe_filename(a["name"]) or "attachment.bin")
+        total = row.get("total") or 0
+        size = os.path.getsize(target) if os.path.exists(target) else -1
+        if size > 0 and (total <= 0 or size >= total):
+            self._attach_finalize_complete(idx)
+            return
+        elif size >= 0:
+            row["state"] = "error"
+            row["gid"] = None
+            row["error"] = "下载已中断，请点击「重新下载」"
+            row["status_text"] = ""
+        else:
+            row["state"] = "error"
+            row["gid"] = None
+            row["error"] = "任务记录已清除（Motrix 可能已重启），请重新下载"
+            row["status_text"] = ""
+        self._render_attach_row(idx)
+
+    def _poll_attach_queue(self):
+        try:
+            while True:
+                kind, idx, payload = self.attach_q.get_nowait()
+                if kind == "state":
+                    self._set_attach_state(idx, payload["state"],
+                                           detail=payload.get("detail"),
+                                           text=payload.get("text"))
+                elif kind == "status":
+                    self._apply_attach_status(idx, payload)
+                elif kind == "gone":
+                    self._apply_attach_gone(idx)
+                elif kind == "log":
+                    self._ui_log(payload.get("text", ""))
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_attach_queue)
 
     def _open_selected_folder(self, _event=None):
         sel = self.file_listbox.curselection()
@@ -1590,13 +2271,6 @@ class ExtractTool:
                 elif kind == "done":
                     self._finish(payload)
                     return
-                elif kind == "attach_done":
-                    ok, fail = payload
-                    self.status_text.set(f"下载完成: 成功 {ok}, 失败 {fail}")
-                    self._ui_log(f"\n下载完成: 成功 {ok}, 失败 {fail}")
-                    self.q = None
-                    messagebox.showinfo("附件下载", f"成功: {ok}, 失败: {fail}\n失败项可在日志中查看原因")
-                    return
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
@@ -1630,7 +2304,8 @@ class ExtractTool:
             parts = [f"成功解压 {success} 个文件"]
             if self.attachments:
                 parts.append(f"识别到 {len(self.attachments)} 个可下载附件，"
-                             + "已列在右侧「可下载附件」栏，勾选后点「浏览器下载」")
+                             + "已列在右侧「可下载附件」栏，点行内「下载」"
+                               "或「全部下载」无头提交 Motrix")
             if self.last_output_dir:
                 parts.append(f"输出目录:\n{self.last_output_dir}")
             messagebox.showinfo("解压完成", "\n".join(parts))
