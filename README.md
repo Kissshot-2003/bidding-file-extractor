@@ -9,6 +9,7 @@
 - **双哈希校验**：解压全程累计 CRC‑32 并与容器内置记录比对，解密/解压产物损坏立即拦截（防止 AES 密钥/算法错误导致的错误文件混入）；解压后自动生成 `_SHA256SUMS.txt`（sha256sum 兼容格式）供人工核验
 - **附件识别与 Motrix 无头下载**：解析容器内元数据（如 `PBZB.xml`，含被排除写盘的内部文件）识别 `<ZBFileCAD><CADFile>` 风格的图纸/清单控制价等下载链接；解压多项目时附件按「项目分组」展示在右栏。点击行内「下载」或「全部下载」即通过 Motrix 持久化的本地 aria2 RPC（`%APPDATA%/Motrix/settings.json` 的 `rpcPort`/`rpcSecret`）**无头提交**——不弹 Motrix 窗口、任务自动开始，文件按附件归属存入各项目输出目录；每行文件名下实时显示进度条与速度，并提供「暂停/继续/停止/重新下载/浏览器」操作；Motrix 未运行时自动拉起并等待引擎就绪
 - **查看页链接自动解析**：epoint/新点平台附件常给出的是图纸查看页（`TuZhiDocShow`）而非文件——提交前自动请求同名 `Action.action` 接口取 `serverFilePath` 真实直链（无需登录态），完成后再嗅探文件头，若误下到网页（链接过期等）立即行内报错并引导浏览器打开，杜绝 4KB 坏文件
+- **Hermes Teal 暗色界面**：深 teal 终端风（奶油文字 + 琥珀强调 + 发丝边框 + 描边按钮），内置 **MiSans** 免费商用字体（`fonts/` 目录，经 `AddFontResourceExW` 私有注册，不打扰系统）；不依赖微软雅黑
 - **可取消**：GUI 解压中可随时取消；取消不计入失败
 - **单条目容错**：ZIP 内部单个坏条目只跳过并告警，其余文件照常解压
 - **后台线程**：解压不阻塞界面，日志/进度实时刷新
@@ -64,11 +65,10 @@
 python test_extract_tool.py   # 单元测试（30+ 用例）
 ```
 
-打包：
+打包（v2.8 起需先确认 `fonts/` 目录有 MiSans 字体，spec 会内嵌进 exe）：
 
 ```
-pyinstaller --noconfirm --clean --onefile --windowed --name 招标文件快速解压工具 ^
-  --icon 招标文件快速解压工具.ico --hidden-import tkinterdnd2 extract_tool.py
+pyinstaller --noconfirm --clean 招标文件快速解压工具_v2.8.spec
 ```
 
 依赖：Python 3.10+（标准库，可选 `tkinterdnd2` 提供窗口拖放）。

@@ -4,6 +4,16 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v2.8 变更：
+  - 界面重构：全新「Hermes Teal」暗色终端风——深 teal 底 + 奶油文字 +
+    琥珀强调色 + 发丝边框 + 描边式按钮（语义色：success/warning/danger）
+  - 新增左侧品牌栏：品牌区、待解压/附件实时计数、ZB TEAL 主题徽标
+    （仿 Hermes Agent 侧栏 + 页脚布局）
+  - 字体：内置 MiSans（小米官方字体，免费商用可再分发；经
+    AddFontResourceEx 私有注册，系统无此字体也能正常显示），
+    等宽场景（版本号/计数/百分比）用系统 Consolas，不再依赖微软雅黑
+  - 打包：字体随 exe 内嵌（spec datas），单文件分发不丢样式
+
 v2.7 变更：
   - 修复：部分平台附件链接（如 epoint/新点 TuZhiDocShow 图纸查看页）是
     HTML 页面而非文件——此前直接提交 Motrix 会"成功"下载到 4KB 网页
@@ -202,7 +212,7 @@ FORMAT_REGISTRY = os.path.join(CONFIG_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(CONFIG_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(CONFIG_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.7"
+APP_VERSION = "v2.8"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -1364,19 +1374,57 @@ except Exception:
     TkinterDnD = None
     DND_FILES = None
 
-# ---- 视觉规范（浅色现代风）----
-FONT = "微软雅黑"
-BG = "#F3F4F6"        # 页面背景（浅灰）
-CARD = "#FFFFFF"      # 卡片背景
-BORDER = "#E5E7EB"    # 边框/分隔线
-FG = "#111827"        # 主文字
-MUTED = "#6B7280"     # 次要文字
-ACCENT = "#2563EB"    # 主色（蓝）
-ACCENT_DARK = "#1E40AF"
-SELECT_BG = "#DBEAFE" # 列表选中底色
-SUCCESS = "#15803D"
-DANGER = "#DC2626"
-WARN = "#B45309"
+# ---- 视觉规范（Hermes Teal 风格：深 teal 暗底 + 奶油文字 + 琥珀强调 + 终端气质）----
+# 字体：MiSans（小米，免费商用可分发，随包内置）；等宽场景用系统 Consolas（仅 ASCII）
+FONT = "微软雅黑"        # 由 _load_bundled_fonts() 覆写
+FONT_MONO = "Consolas"
+BG = "#041c1c"        # 页面背景（深 teal）
+SIDEBAR = "#021414"   # 侧栏（更深一档）
+CARD = "#072727"      # 卡片背景
+BORDER = "#154341"    # 发丝边框
+FG = "#ffe6cb"        # 主文字（奶油）
+MUTED = "#a79f8d"     # 次要文字（奶油 65%，同 Hermes text-tertiary）
+DIM = "#74837d"       # 更暗的辅助文字
+ACCENT = "#ffac02"    # 主色（琥珀，同 Hermes midground）
+ACCENT_DARK = "#cc8a02"
+SELECT_BG = "#0f3a38" # 列表选中底色
+SUCCESS = "#4ade80"
+DANGER = "#fb2c36"
+WARN = "#ffbd38"
+STATUSBAR = "#021212"
+LOG_BG = "#021919"
+
+
+def _load_bundled_fonts():
+    """注册随包分发的免费字体（MiSans，允许免费商用与再分发），
+    覆写全局 FONT。加载失败时回退系统字体，不影响使用。"""
+    global FONT
+    if os.name != "nt":
+        return
+    import ctypes
+    FR_PRIVATE = 0x10
+    dirs = []
+    try:
+        base = getattr(sys, "_MEIPASS", "")
+        if base:
+            dirs.append(os.path.join(base, "fonts"))
+    except Exception:
+        pass
+    dirs.append(os.path.join(APP_DIR, "fonts"))
+    loaded = False
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.lower().endswith((".ttf", ".otf")):
+                try:
+                    if ctypes.windll.gdi32.AddFontResourceExW(
+                            os.path.join(d, fn), FR_PRIVATE, 0):
+                        loaded = True
+                except Exception:
+                    pass
+    if loaded:
+        FONT = "MiSans"
 
 
 def _enable_high_dpi():
@@ -1410,41 +1458,70 @@ def _setup_style(root):
     style.configure(".", background=BG, foreground=FG, borderwidth=0, font=(FONT, 9))
     style.configure("TFrame", background=BG)
     style.configure("Card.TFrame", background=CARD)
+    style.configure("Rail.TFrame", background=SIDEBAR)
     style.configure("TLabel", background=BG, foreground=FG)
     style.configure("Card.TLabel", background=CARD, foreground=FG)
+    style.configure("Rail.TLabel", background=SIDEBAR, foreground=FG)
     style.configure("Muted.TLabel", background=BG, foreground=MUTED)
     style.configure("CardMuted.TLabel", background=CARD, foreground=MUTED)
-    style.configure("H1.TLabel", background=CARD, foreground=FG, font=(FONT, 13, "bold"))
-    style.configure("Sub.TLabel", background=CARD, foreground=MUTED, font=(FONT, 8))
+    style.configure("RailMuted.TLabel", background=SIDEBAR, foreground=DIM)
+    style.configure("H1.TLabel", background=BG, foreground=ACCENT,
+                    font=(FONT, 13, "bold"))
+    style.configure("Sub.TLabel", background=BG, foreground=DIM, font=(FONT, 8))
     style.configure("Section.TLabel", background=BG, foreground=FG, font=(FONT, 10, "bold"))
-    style.configure("Pct.TLabel", background=BG, foreground=MUTED, font=(FONT, 9))
-    style.configure("Status.TLabel", background="#ECEDF1", foreground=MUTED)
-    # 普通按钮（扁平灰）
-    style.configure("TButton", background=CARD, foreground="#374151",
-                    padding=(12, 6), borderwidth=0, font=(FONT, 9))
+    style.configure("Pct.TLabel", background=BG, foreground=MUTED,
+                    font=(FONT_MONO, 9))
+    style.configure("Status.TLabel", background=STATUSBAR, foreground=MUTED)
+    style.configure("Badge.TLabel", background=SIDEBAR, foreground=ACCENT,
+                    font=(FONT_MONO, 8, "bold"))
+    style.configure("RailVer.TLabel", background=SIDEBAR, foreground=DIM,
+                    font=(FONT_MONO, 8))
+    # 普通按钮（终端式描边：深底 + 发丝边框，悬停边框/文字转琥珀）
+    style.configure("TButton", background=CARD, foreground=FG,
+                    padding=(12, 5), borderwidth=1, relief="solid",
+                    bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD,
+                    font=(FONT, 9))
     style.map("TButton",
-              background=[("pressed", "#E5E7EB"), ("active", "#EFF1F4")],
-              foreground=[("disabled", "#9CA3AF")])
-    # 主按钮（蓝色大按钮）
-    style.configure("Primary.TButton", background=ACCENT, foreground="white",
-                    padding=(22, 9), borderwidth=0, font=(FONT, 11, "bold"))
+              background=[("pressed", SELECT_BG), ("active", SELECT_BG)],
+              bordercolor=[("active", ACCENT)],
+              foreground=[("disabled", DIM), ("active", ACCENT)])
+    # 主按钮（琥珀大按钮：深色文字，与暗底形成强对比）
+    style.configure("Primary.TButton", background=ACCENT, foreground="#1c1000",
+                    padding=(22, 8), borderwidth=1, relief="solid",
+                    bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
+                    font=(FONT, 11, "bold"))
     style.map("Primary.TButton",
-              background=[("disabled", "#93B4F5"), ("pressed", ACCENT_DARK), ("active", ACCENT_DARK)],
-              foreground=[("disabled", "#F3F6FE")])
-    # 复选框（页面背景上）
-    style.configure("TCheckbutton", background=BG, foreground=FG,
+              background=[("disabled", "#5e4408"), ("pressed", "#ffbd38"), ("active", "#ffbd38")],
+              foreground=[("disabled", "#0d2925")])
+    # 危险动作（描边转红）
+    style.configure("Danger.TButton", bordercolor="#5e2624", foreground="#ff9c9c")
+    style.map("Danger.TButton",
+              bordercolor=[("active", DANGER)],
+              foreground=[("active", DANGER), ("disabled", DIM)])
+    # 附件行内小按钮（紧凑描边）
+    style.configure("Row.TButton", background=CARD, foreground=FG,
+                    padding=(9, 3), borderwidth=1, relief="solid",
+                    bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD,
+                    font=(FONT, 8))
+    style.map("Row.TButton",
+              background=[("pressed", SELECT_BG), ("active", SELECT_BG)],
+              bordercolor=[("active", ACCENT)],
+              foreground=[("disabled", DIM), ("active", ACCENT)])
+    # 复选框（页面上）
+    style.configure("TCheckbutton", background=BG, foreground=MUTED,
                     focuscolor=BG, font=(FONT, 9))
-    style.map("TCheckbutton", background=[("active", BG)])
-    # 复选框（卡片内）
-    style.configure("Card.TCheckbutton", background=CARD, foreground=FG,
-                    focuscolor=CARD, font=(FONT, 9))
-    style.map("Card.TCheckbutton", background=[("active", CARD)])
-    # 进度条
-    style.configure("Accent.Horizontal.TProgressbar", troughcolor=BORDER,
+    style.map("TCheckbutton",
+              background=[("active", BG)],
+              foreground=[("active", FG)])
+    # 进度条（琥珀填充 + 深槽）
+    style.configure("Accent.Horizontal.TProgressbar", troughcolor=CARD,
                     background=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
-                    borderwidth=0, thickness=10)
-    # 分隔线
+                    bordercolor=BG, borderwidth=0, thickness=8)
+    # 分隔线 / 滚动条
     style.configure("TSeparator", background=BORDER)
+    style.configure("TScrollbar", background=SIDEBAR, troughcolor=BG,
+                    bordercolor=BG, arrowcolor=DIM, relief="flat")
+    style.map("TScrollbar", background=[("active", CARD)])
 
 
 def _set_app_icon(root):
@@ -1463,6 +1540,7 @@ def _set_app_icon(root):
 
 def make_root():
     _enable_high_dpi()
+    _load_bundled_fonts()
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     _apply_dpi_scaling(root)
     _setup_style(root)
@@ -1519,8 +1597,8 @@ class ExtractTool:
     def __init__(self):
         self.root = make_root()
         self.root.title(f"招标文件快速解压工具 {APP_VERSION}")
-        self.root.geometry("920x640")
-        self.root.minsize(760, 520)
+        self.root.geometry("1150x680")
+        self.root.minsize(1000, 560)
         self.root.configure(background=BG)
         self.files = []
         self.is_running = False
@@ -1549,27 +1627,56 @@ class ExtractTool:
         self.root.bind_all("<MouseWheel>", self._attach_mousewheel)
 
     def _build_ui(self):
-        # ---- 状态栏（沉底）----
-        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
-        statusbar = tk.Frame(self.root, background="#ECEDF1", height=30)
+        # ---- 状态栏（沉底，终端风）----
+        statusbar = tk.Frame(self.root, background=STATUSBAR, height=28)
         statusbar.pack(side=tk.BOTTOM, fill=tk.X)
         statusbar.pack_propagate(False)
         ttk.Label(statusbar, textvariable=self.status_text,
                   style="Status.TLabel").pack(side=tk.LEFT, padx=12)
-        ttk.Label(statusbar, text=APP_VERSION,
-                  style="Status.TLabel").pack(side=tk.RIGHT, padx=12)
+        ttk.Label(statusbar, text=f"ZB TEAL · {APP_VERSION}",
+                  style="Status.TLabel",
+                  font=(FONT_MONO, 8)).pack(side=tk.RIGHT, padx=12)
 
-        # ---- 顶栏（卡片色 + 下边线）----
-        header = tk.Frame(self.root, background=CARD,
-                          highlightthickness=1, highlightbackground=BORDER)
+        # ---- 左侧品牌栏（仿 Hermes 侧栏：品牌 + 统计 + 主题徽标）----
+        rail = tk.Frame(self.root, background=SIDEBAR, width=138)
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        rail.pack_propagate(False)
+        ttk.Label(rail, text="招标文件", style="Rail.TLabel",
+                  font=(FONT, 12, "bold")).pack(anchor="w", padx=14, pady=(18, 0))
+        ttk.Label(rail, text="快速解压", style="Rail.TLabel",
+                  font=(FONT, 12, "bold")).pack(anchor="w", padx=14, pady=(2, 4))
+        ttk.Label(rail, text="EXTRACTOR", style="Badge.TLabel").pack(anchor="w", padx=14)
+        tk.Frame(rail, background=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(14, 10))
+        ttk.Label(rail, text="待解压", style="RailMuted.TLabel",
+                  font=(FONT, 8)).pack(anchor="w", padx=14)
+        self.rail_files = ttk.Label(rail, text="0", style="Rail.TLabel",
+                                    font=(FONT_MONO, 12, "bold"))
+        self.rail_files.pack(anchor="w", padx=14, pady=(0, 8))
+        ttk.Label(rail, text="可下载附件", style="RailMuted.TLabel",
+                  font=(FONT, 8)).pack(anchor="w", padx=14)
+        self.rail_attach = ttk.Label(rail, text="0", style="Rail.TLabel",
+                                     font=(FONT_MONO, 12, "bold"))
+        self.rail_attach.pack(anchor="w", padx=14, pady=(0, 8))
+        tk.Frame(rail, background=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(10, 10))
+        rail_bottom = tk.Frame(rail, background=SIDEBAR)
+        rail_bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+        ttk.Label(rail_bottom, text="● ZB TEAL", style="Badge.TLabel").pack(anchor="w", padx=14)
+        ttk.Label(rail_bottom, text=f"{APP_VERSION} · *zf/*cf",
+                  style="RailVer.TLabel").pack(anchor="w", padx=14, pady=(2, 0))
+        # 侧栏右发丝分隔线
+        tk.Frame(self.root, background=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
+
+        # ---- 顶栏（页面标题，琥珀 + 下发丝线）----
+        header = tk.Frame(self.root, background=BG)
         header.pack(fill=tk.X)
-        ttk.Label(header, text="招标文件快速解压工具",
-                  style="H1.TLabel").pack(side=tk.LEFT, padx=(16, 10), pady=12)
-        ttk.Label(header, text=f"{APP_VERSION} | 支持任意 *zf / *cf | 标签自动识别 | 后台解压不卡界面",
+        ttk.Label(header, text="解压工作台",
+                  style="H1.TLabel").pack(side=tk.LEFT, padx=(16, 10), pady=10)
+        ttk.Label(header, text="支持任意 *zf / *cf | 标签自动识别 | 后台解压不卡界面",
                   style="Sub.TLabel").pack(side=tk.LEFT, pady=(4, 0))
+        tk.Frame(header, background=BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
 
         # ---- 主内容区 ----
-        main = ttk.Frame(self.root, padding=(14, 12))
+        main = ttk.Frame(self.root, padding=(12, 10))
         main.pack(fill=tk.BOTH, expand=True)
 
         # 左右分栏：左列（待解压文件+操作+日志），右栏（可下载附件）
@@ -1626,7 +1733,7 @@ class ExtractTool:
         self.btn_extract = ttk.Button(act, text="开始解压",
                                       style="Primary.TButton", command=self._start_extract)
         self.btn_extract.pack(side=tk.LEFT)
-        self.btn_cancel = ttk.Button(act, text="取消解压",
+        self.btn_cancel = ttk.Button(act, text="取消解压", style="Danger.TButton",
                                      command=self._cancel_extract, state=tk.DISABLED)
         self.btn_cancel.pack(side=tk.LEFT, padx=6)
         ttk.Checkbutton(act, text="SHA-256 校验清单",
@@ -1692,11 +1799,11 @@ class ExtractTool:
         ttk.Label(log_head, text="解压日志", style="Section.TLabel").pack(side=tk.LEFT)
         ttk.Button(log_head, text="清空日志",
                    command=self._clear_log).pack(side=tk.RIGHT)
-        log_card = tk.Frame(left_col, background="#FAFBFC", highlightthickness=1,
+        log_card = tk.Frame(left_col, background=LOG_BG, highlightthickness=1,
                             highlightbackground=BORDER, highlightcolor=ACCENT)
         log_card.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
 
-        self.log_text = tk.Text(log_card, height=8, font=(FONT, 9), bg="#FAFBFC",
+        self.log_text = tk.Text(log_card, height=8, font=(FONT, 9), bg=LOG_BG,
                                 fg=FG, relief="flat", padx=8, pady=6, wrap="none",
                                 insertbackground=FG, selectbackground=SELECT_BG,
                                 selectforeground=FG)
@@ -1752,6 +1859,10 @@ class ExtractTool:
         """刷新计数徽标与空列表提示。"""
         n = len(self.files)
         self.count_label.config(text=f"待解压文件（{n}）")
+        try:
+            self.rail_files.config(text=str(n))
+        except Exception:
+            pass
         if n:
             self.hint_label.place_forget()
         else:
@@ -1781,6 +1892,10 @@ class ExtractTool:
         n_proj = len(projects)
         suffix = f" · {n_proj} 项目" if n_proj > 1 else ""
         self.attach_count.config(text=f"（{len(self.attachments)} 个{suffix}）")
+        try:
+            self.rail_attach.config(text=str(len(self.attachments)))
+        except Exception:
+            pass
         self.attach_hint.pack_forget()
         self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
@@ -1848,7 +1963,8 @@ class ExtractTool:
         st = row["state"]
 
         def add(text, cmd):
-            ttk.Button(row["btns"], text=text, command=cmd).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Button(row["btns"], text=text, style="Row.TButton",
+                       command=cmd).pack(side=tk.LEFT, padx=(0, 4))
 
         if st == "idle":
             add("下载", lambda i=idx: self._attach_start(i))
@@ -2410,12 +2526,12 @@ class AutoRunner:
         else:
             self.root.attributes("-topmost", True)
 
-        header = tk.Frame(self.root, background=CARD,
-                          highlightthickness=1, highlightbackground=BORDER)
+        header = tk.Frame(self.root, background=BG)
         header.pack(fill=tk.X)
         ttk.Label(header, text="自动解压", style="H1.TLabel").pack(side=tk.LEFT, padx=(16, 10), pady=12)
         ttk.Label(header, text=f"{APP_VERSION} | 拖放或命令行触发",
                   style="Sub.TLabel").pack(side=tk.LEFT, pady=(4, 0))
+        tk.Frame(header, background=BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
 
         main = ttk.Frame(self.root, padding=(14, 10))
         main.pack(fill=tk.BOTH, expand=True)
@@ -2435,7 +2551,7 @@ class AutoRunner:
         log_card = tk.Frame(main, background="#FAFBFC", highlightthickness=1,
                             highlightbackground=BORDER, highlightcolor=ACCENT)
         log_card.pack(fill=tk.BOTH, expand=True)
-        self.log_text = tk.Text(log_card, font=(FONT, 9), bg="#FAFBFC", fg=FG,
+        self.log_text = tk.Text(log_card, font=(FONT, 9), bg=LOG_BG, fg=FG,
                                 relief="flat", padx=8, pady=6, wrap="none",
                                 insertbackground=FG, selectbackground=SELECT_BG,
                                 selectforeground=FG)
