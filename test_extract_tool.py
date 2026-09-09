@@ -9,6 +9,7 @@ import io
 import copy
 import json
 import base64
+import hashlib
 import zipfile
 import tempfile
 import shutil
@@ -614,6 +615,274 @@ class CliHelperTests(unittest.TestCase):
             self.assertFalse(et._sniff_html_file(os.path.join(tmp, "missing.rar")))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_themes_complete_and_apply(self):
+        # 两个主题 token 完整且一致；_apply_theme 正确写入全局
+        base = {"BG", "SIDEBAR", "CARD", "BORDER", "FG", "MUTED", "DIM",
+                "ACCENT", "ACCENT_DARK", "SELECT_BG", "SUCCESS", "DANGER",
+                "WARN", "STATUSBAR", "LOG_BG", "PRIMARY_FG",
+                "PRIMARY_DISABLED_BG", "DANGER_FG", "DANGER_BORDER"}
+        for name, t in et.THEMES.items():
+            self.assertEqual(set(t), base, name)
+        et._apply_theme("zb-light")
+        self.assertEqual(et.BG, et.THEMES["zb-light"]["BG"])
+        self.assertEqual(et._current_theme_name(), "zb-light")
+        et._apply_theme("zb-teal")
+        self.assertEqual(et.BG, et.THEMES["zb-teal"]["BG"])
+        self.assertEqual(et._current_theme_name(), "zb-teal")
+        et._apply_theme("nonexistent")
+        self.assertEqual(et._current_theme_name(), "zb-teal")  # 未知主题回退
+        et._apply_theme("zb-light")  # 还原默认（其余用例不受暗色影响）
+
+
+def _pkcs7_pad(data):
+    n = 16 - len(data) % 16
+    return data + bytes([n]) * n
+
+
+def _aes_ecb_encrypt(data, key):
+    """用工具自带的 AES 原语做 ECB 加密（仅测试用）。"""
+    w, Nr = et._key_expansion(key)
+    out = b""
+    for i in range(0, len(data), 16):
+        out += et._aes_encrypt_block(data[i:i + 16], w, Nr)
+    return out
+
+
+GUID = "63a2c211-4304-415b-98ef-e83c76a8efba"
+AQZF_PLAIN = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<JingJiBiao Xmbh=\"xm0\">清单一</JingJiBiao>".encode("utf-8")
+PBZB_ON = ('<?xml version="1.0" encoding="utf-8"?><XiangMuInfo AreaName="DQAnQing">'
+           "<BiaoShu><ZBInfo>"
+           '<ZBInfoMx BookMarkName="EncryQingDan" MarkValue="1" Xh="1"/>'
+           '<ZBInfoMx BookMarkName="EncryKey" MarkValue="%s" Xh="1"/>'
+           "</ZBInfo></BiaoShu></XiangMuInfo>" % GUID).encode("utf-8")
+
+
+def _make_aqzf_file(dirpath, filename, inner_name, inner_plain, pbzb, encry_key=GUID):
+    """构造合成 .AQZF（XML 包裹 + base64 ZIP{PBZB.xml + 加密清单}）。"""
+    if encry_key:
+        digest = hashlib.md5(encry_key.strip().encode("utf-8")).digest()
+        key = digest[8:] + digest[:8]
+        inner = _aes_ecb_encrypt(_pkcs7_pad(inner_plain), key)
+    else:
+        inner = inner_plain
+    z = make_zip_bytes([("PBZB.xml", pbzb), (inner_name, inner)])
+    xml = (HDR + '<ZBFile xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+           "<ZBGuid>B8BD8B96</ZBGuid><UserIdentifier>69E3007A</UserIdentifier>"
+           "<ZBFileContent>" + wrap_b64(z) + "</ZBFileContent>"
+           "<EncryMode>3</EncryMode><GMtype>EPGM_0</GMtype></ZBFile>")
+    return write_case(dirpath, filename, xml)
+
+
+class AqzfDecryptTests(ExtractTestBase):
+    """安庆 .AQZF 内层清单解密（MD5(EncryKey) 轮换 → AES-128-ECB/PKCS7）。
+    v3.1：多标段多密钥、EncryQingDan 非 "0" 均尝试、PKCS7 严格校验。"""
+
+    def test_decrypt_roundtrip_and_key_rotation(self):
+        import hashlib as _h
+        d = _h.md5(GUID.encode()).digest()
+        # 轮换密钥可解；未轮换的原始 MD5 不可解（防止实现退化）
+        self.assertEqual(et._aqzf_pbzb_decrypt(
+            _aes_ecb_encrypt(_pkcs7_pad(AQZF_PLAIN), d[8:] + d[:8]), GUID), AQZF_PLAIN)
+        wrong = et.aes_ecb_decrypt(
+            _aes_ecb_encrypt(_pkcs7_pad(AQZF_PLAIN), d[8:] + d[:8]), d)
+        self.assertNotEqual(wrong, _pkcs7_pad(AQZF_PLAIN))  # 未轮换密钥解不开轮换密文
+        # 错误密钥必须报错而非静默返回乱文（PKCS7 严格校验）
+        with self.assertRaises(Exception):
+            et._aqzf_pbzb_decrypt(
+                _aes_ecb_encrypt(_pkcs7_pad(AQZF_PLAIN), d[8:] + d[:8]),
+                "00000000-0000-0000-0000-000000000000")
+
+    def test_pkcs7_unpad_strict(self):
+        """v3.1：PKCS7 填充非法/为空/长度非块对齐必须抛错。"""
+        self.assertEqual(et.pkcs7_unpad(_pkcs7_pad(b"abc")), b"abc")
+        self.assertEqual(et.pkcs7_unpad(_pkcs7_pad(b"x" * 16)), b"x" * 16)
+        with self.assertRaises(Exception):
+            et.pkcs7_unpad(b"A" * 16)  # 填充非法
+        with self.assertRaises(Exception):
+            et.pkcs7_unpad(b"")  # 空
+        with self.assertRaises(Exception):
+            et.pkcs7_unpad(b"abc")  # 长度非块对齐
+
+    def test_parse_pbzb_zbinfo_attribute_order(self):
+        k, f = et._parse_pbzb_zbinfo(PBZB_ON.decode("utf-8"))
+        self.assertEqual((k, f), ([GUID], "1"))
+        # 属性顺序颠倒也应解析
+        xml2 = ('<ZBInfo><ZBInfoMx MarkValue="%s" BookMarkName="EncryKey"/>'
+                '<ZBInfoMx MarkValue="1" BookMarkName="EncryQingDan"/></ZBInfo>' % GUID)
+        k2, f2 = et._parse_pbzb_zbinfo(xml2)
+        self.assertEqual((k2, f2), ([GUID], "1"))
+        # 缺书签
+        self.assertEqual(et._parse_pbzb_zbinfo("<ZBInfo></ZBInfo>"), ([], None))
+
+    def test_parse_pbzb_zbinfo_multi_segment(self):
+        """v3.1：多标段容器含多个 EncryKey，全部收集、去重、保持顺序。"""
+        k1, k2 = GUID, "11111111-2222-3333-4444-555555555555"
+        xml = ('<ZBInfo>'
+               '<ZBInfoMx BookMarkName="EncryQingDan" MarkValue="1"/>'
+               f'<ZBInfoMx BookMarkName="EncryKey" MarkValue="{k1}"/>'
+               f'<ZBInfoMx BookMarkName="EncryKey" MarkValue="{k2}"/>'
+               f'<ZBInfoMx BookMarkName="EncryKey" MarkValue="{k1}"/>'  # 重复：去重
+               "</ZBInfo>")
+        keys, flag = et._parse_pbzb_zbinfo(xml)
+        self.assertEqual(keys, [k1, k2])
+        self.assertEqual(flag, "1")
+
+    def test_decrypt_best_multi_key(self):
+        """v3.1：多密钥逐个尝试，命中正确密钥并返回命中者。"""
+        import hashlib as _h
+        k_other = "00000000-0000-0000-0000-000000000000"
+        d = _h.md5(GUID.encode()).digest()
+        cipher = _aes_ecb_encrypt(_pkcs7_pad(AQZF_PLAIN), d[8:] + d[:8])
+        out, used = et._aqzf_pbzb_decrypt_best(cipher, [k_other, GUID])
+        self.assertEqual(out, AQZF_PLAIN)
+        self.assertEqual(used, GUID)
+        with self.assertRaises(Exception):
+            et._aqzf_pbzb_decrypt_best(cipher, [k_other])  # 全部失败抛最后异常
+        with self.assertRaises(Exception):
+            et._aqzf_pbzb_decrypt_best(cipher, [])  # 无密钥
+
+    def test_extract_aqzf_decrypts_qd(self):
+        """端到端：AQZF 容器内 .18aqzb 自动解密为明文 XML（官方工具一致行为）。"""
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, PBZB_ON)
+        r = et.extract_file(src)
+        self.assertEqual(sorted(r["files"]), ["某项目.18aqzb"])
+        out = os.path.join(r["dir"], "某项目.18aqzb")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), AQZF_PLAIN)
+        # PBZB.xml 仍是内部文件不落盘；校验清单记录的是解密后内容
+        self.assertNotIn("PBZB.xml", r["files"])
+        with open(r["checksum_file"], "rb") as f:
+            self.assertNotIn(b"PBZB.xml", f.read())
+
+    def test_extract_aqzf_multi_segment_container(self):
+        """v3.1 端到端：多标段容器（两个 EncryKey），清单用第二个密钥加密，
+        旧版只取最后一个/第一个密钥会失败，现逐个尝试命中解出明文。"""
+        k2 = "11111111-2222-3333-4444-555555555555"
+        pbzb = ('<?xml version="1.0" encoding="utf-8"?><XiangMuInfo AreaName="DQAnQing">'
+                "<BiaoShu><ZBInfo>"
+                '<ZBInfoMx BookMarkName="EncryQingDan" MarkValue="1" Xh="1"/>'
+                '<ZBInfoMx BookMarkName="EncryKey" MarkValue="%s" Xh="1"/>'
+                '<ZBInfoMx BookMarkName="EncryKey" MarkValue="%s" Xh="1"/>'
+                "</ZBInfo></BiaoShu></XiangMuInfo>" % (GUID, k2)).encode("utf-8")
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, pbzb, encry_key=k2)
+        logs = []
+        r = et.extract_file(src, log=logs.append)
+        self.assertEqual(r["files"], ["某项目.18aqzb"])
+        self.assertEqual(r["warnings"], 0)
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertEqual(f.read(), AQZF_PLAIN)
+        self.assertTrue(any("2/2" in ln for ln in logs))  # 命中第 2 个密钥
+
+    def test_extract_aqzf_flag_true_still_decrypts(self):
+        """v3.1：EncryQingDan="true" 等非 "0" 值也尝试解密（旧版静默落盘密文）。"""
+        pbzb = PBZB_ON.replace(b'MarkValue="1" Xh="1"/>', b'MarkValue="true" Xh="1"/>', 1)
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, pbzb)
+        r = et.extract_file(src)
+        self.assertEqual(r["warnings"], 0)
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertEqual(f.read(), AQZF_PLAIN)
+
+    def test_extract_aqzf_flag_off_exports_raw(self):
+        """EncryQingDan="0"/"false"：清单未加密，应原样导出且不告警。"""
+        for off in ("0", "false"):
+            pbzb = PBZB_ON.replace(b'MarkValue="1" Xh="1"/>',
+                                   b'MarkValue="%s" Xh="1"/>' % off.encode(), 1)
+            src = _make_aqzf_file(self.tmp, "proj_%s.AQZF" % off,
+                                  "某项目.18aqzb", AQZF_PLAIN, pbzb, encry_key=None)
+            r = et.extract_file(src)
+            self.assertEqual(r["warnings"], 0, off)
+            with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+                self.assertEqual(f.read(), AQZF_PLAIN, off)
+
+    def test_extract_aqzf_verify_xml_off(self):
+        """v3.1：verify_xml=false 时非 XML 解密结果也放行落盘（配置生效）。"""
+        import hashlib as _h
+        payload = "NOT-XML 裸数据清单，没有 <?xml 声明".encode("utf-8")
+        rules = {".18aqzb": {"enabled": True, "algorithm": "AQZF-PBZB",
+                             "verify_xml": False}}
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", payload, PBZB_ON)
+        with mock.patch.object(et, "_load_decrypt_config",
+                               return_value=(rules, {"PBZB.xml"})):
+            r = et.extract_file(src)
+        self.assertEqual(r["warnings"], 0)
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertEqual(f.read(), payload)  # 解密后的非 XML 内容直接落盘
+
+    def test_extract_aqzf_flag_off_exports_raw(self):
+        """EncryQingDan != 1：清单未加密，应原样导出且不告警。"""
+        pbzb = PBZB_ON.replace(b'MarkValue="1" Xh="1"/>', b'MarkValue="0" Xh="1"/>', 1)
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, pbzb, encry_key=None)
+        logs = []
+        r = et.extract_file(src, log=logs.append)
+        self.assertEqual(r["files"], ["某项目.18aqzb"])
+        self.assertEqual(r["warnings"], 0)
+        out = os.path.join(r["dir"], "某项目.18aqzb")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), AQZF_PLAIN)
+
+    def test_extract_aqzf_no_key_warns_and_keeps_cipher(self):
+        """PBZB.xml 缺 EncryKey：原样导出密文并告警（不拦截条目）。"""
+        pbzb = PBZB_ON.replace(
+            ('<ZBInfoMx BookMarkName="EncryKey" MarkValue="%s" Xh="1"/>' % GUID).encode("utf-8"),
+            b"")
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, pbzb)
+        logs = []
+        r = et.extract_file(src, log=logs.append)
+        self.assertEqual(r["files"], ["某项目.18aqzb"])
+        self.assertEqual(r["warnings"], 1)
+        self.assertTrue(any("EncryKey" in ln for ln in logs))
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertNotEqual(f.read(), AQZF_PLAIN)  # 仍是密文
+
+    def test_extract_aqzf_wrong_key_falls_back_to_cipher(self):
+        """密钥不匹配（解出非 XML）：回退原样导出密文并告警，不删文件。"""
+        src = _make_aqzf_file(self.tmp, "proj.AQZF",
+                              "某项目.18aqzb", AQZF_PLAIN, PBZB_ON,
+                              encry_key="11111111-2222-3333-4444-555555555555")
+        logs = []
+        r = et.extract_file(src, log=logs.append)
+        self.assertEqual(r["files"], ["某项目.18aqzb"])
+        self.assertEqual(r["warnings"], 1)
+        self.assertTrue(any("解密失败" in ln for ln in logs))
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertNotEqual(f.read(), AQZF_PLAIN)
+
+    def test_aqzf_pbzb_exts_config(self):
+        """decrypt_config.json 规则：AQZF-PBZB 可增删参与解密的扩展名。"""
+        self.assertIn(".18aqzb", et._aqzf_pbzb_exts({}))
+        rules = {".18aqzb": {"algorithm": "AQZF-PBZB", "enabled": False},
+                 ".18aqkz": {"algorithm": "AQZF-PBZB", "enabled": True},
+                 ".18cxj": {"enabled": True}}  # 非 AQZF-PBZB 规则不参与
+        exts = et._aqzf_pbzb_exts(rules)
+        self.assertNotIn(".18aqzb", exts)
+        self.assertIn(".18aqkz", exts)
+        self.assertNotIn(".18cxj", exts)
+
+    def test_extract_other_inner_files_untouched(self):
+        """容器内其它明文条目与清单共存时不受解密影响，全部正常解出。"""
+        import hashlib as _h
+        d = _h.md5(GUID.encode()).digest()
+        key = d[8:] + d[:8]
+        inner = _aes_ecb_encrypt(_pkcs7_pad(AQZF_PLAIN), key)
+        z = make_zip_bytes([("PBZB.xml", PBZB_ON),
+                            ("某项目.18aqzb", inner),
+                            ("清单.pdf", self.pdf())])
+        xml = (HDR + '<ZBFile><ZBFileContent>' + wrap_b64(z)
+               + "</ZBFileContent></ZBFile>")
+        src = write_case(self.tmp, "proj2.AQZF", xml)
+        r = et.extract_file(src)
+        self.assertEqual(sorted(r["files"]), ["某项目.18aqzb", "清单.pdf"])
+        with open(os.path.join(r["dir"], "清单.pdf"), "rb") as f:
+            self.assertEqual(f.read(), self.pdf())
+        with open(os.path.join(r["dir"], "某项目.18aqzb"), "rb") as f:
+            self.assertEqual(f.read(), AQZF_PLAIN)
 
 
 if __name__ == "__main__":

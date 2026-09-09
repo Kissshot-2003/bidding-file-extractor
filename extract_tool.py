@@ -4,6 +4,40 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v3.1 变更：
+  - 修复：安庆 .AQZF 多标段容器——此前仅取 PBZB.xml 最后一个 EncryKey，
+    多标段（各标段密钥不同）会解不开；现收集全部密钥逐个尝试，
+    多密钥命中时日志标明是第几个密钥
+  - 修复：EncryQingDan 为 "0"/"1" 以外的值（如 "true"）时此前把加密清单
+    静默导出密文、无任何告警；现除明确 "0"/"false"（未加密）外均尝试
+    解密，失败回退原样导出并告警
+  - 增强：PKCS7 填充严格校验——非法填充直接判解密失败（防错误密钥蒙混
+    过关、防真实明文尾部被误删）；密文未填充而明文本身已是 XML 时放行
+  - 增强：AQZF 分支 verify_xml 配置生效（decrypt_config.json 可关闭
+    XML 嗅探）；XML 嗅探容忍前导空白（\r\n<?xml 也识别）
+  - 性能：优先使用 pycryptodome（C 实现 AES），未安装回退内置纯 Python
+    实现，零依赖单文件分发不受影响
+  - 重构：解密产物落盘/哈希统一 _store_entry，消除 AQZF 与通用分支重复
+
+v3.0 变更：
+  - 修复：安庆 .AQZF 容器内 .18aqzb 清单文件为加密存储，此前原样导出密文
+    导致官方软件打开报错（与官方工具导出的明文对不上）。现已内置解密：
+    从容器内 PBZB.xml 读取 ZBInfoMx EncryKey（GUID），按
+    「MD5(EncryKey) 前8/后8字节轮换 → AES-128-ECB/PKCS7」解密，
+    输出与官方工具「导出招标解密清单」逐字节一致（已实测比对 SHA-256）。
+    解密失败或 EncryQingDan != 1 时回退原样导出密文并告警
+  - decrypt_config.json 新增规则算法 "AQZF-PBZB"：可扩展启用其它同样
+    加密方式的内层格式（默认启用 .18aqzb）
+
+v2.9 变更：
+  - 双主题：新增浅色「ZB LIGHT」（暖纸底 + 墨色文字 + 琥珀强调，与暗色
+    同源设计语言）；侧栏徽标变为一键切换按钮（ZB LIGHT ⇄ ZB TEAL），
+    选择持久化到 ui_config.json，自动解压小窗同步跟随
+  - 主题热切换：原地重建窗口内容——文件列表、附件行下载状态
+    （gid/进度/错误，进行中任务由轮询线程无缝跟踪）、日志内容全保留
+  - 主题 token 集中到 THEMES 表（含主按钮/危险按钮衍生色），样式全部
+    参数化，新增主题只需加一份 token 字典
+
 v2.8 变更：
   - 界面重构：全新「Hermes Teal」暗色终端风——深 teal 底 + 奶油文字 +
     琥珀强调色 + 发丝边框 + 描边式按钮（语义色：success/warning/danger）
@@ -212,7 +246,7 @@ FORMAT_REGISTRY = os.path.join(CONFIG_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(CONFIG_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(CONFIG_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v2.8"
+APP_VERSION = "v3.1"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -228,6 +262,10 @@ def _is_supported_ext(ext):
 INTERNAL_FILES = {"PBZB.xml"}
 # 已知需要解密的导出容器扩展名（用于在未配置密钥时给出告警提示）。
 KNOWN_ENCRYPTED_EXTS = {".ahaqslzb"}
+# 安庆新点 J 系列容器（.AQZF 等）内加密清单的默认扩展名：
+# PBZB.xml ZBInfoMx EncryQingDan="1" 时，内层清单以
+# 「MD5(EncryKey) 前8/后8字节轮换 → AES-128-ECB/PKCS7」加密存储。
+AQZF_ENCRYPTED_EXTS = {".18aqzb"}
 # 单次解压总量上限（字节），防 zip 炸弹；可通过环境变量 EXTRACT_MAX_SIZE 覆盖。
 MAX_TOTAL_SIZE = int(os.environ.get("EXTRACT_MAX_SIZE", 2 * 1024 ** 3))  # 默认 2GB
 
@@ -285,9 +323,15 @@ def _get_format_extensions(learned):
 
 
 # ============================================================================
-# 纯 Python AES（ECB / CBC，支持 128/192/256）—— 零依赖，便于打包进 exe。
-# 正确性已用 cryptography 库对照验证。
+# AES（ECB / CBC，支持 128/192/256）—— 优先 pycryptodome（C 实现，快数十倍），
+# 未安装时回退下方纯 Python 实现，零依赖打包不受影响。
+# 纯 Python 实现正确性已用 cryptography 库对照验证。
 # ============================================================================
+try:
+    from Crypto.Cipher import AES as _AES_C
+except Exception:  # 未安装 pycryptodome：回退纯 Python
+    _AES_C = None
+
 _SBOX = [
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -437,6 +481,8 @@ def aes_cbc_decrypt(ciphertext, key, iv):
         raise ValueError("AES key must be 16/24/32 bytes")
     if len(ciphertext) % 16 != 0 or len(iv) != 16:
         raise ValueError("ciphertext must be multiple of 16 and iv 16 bytes")
+    if _AES_C is not None:
+        return _AES_C.new(key, _AES_C.MODE_CBC, iv).decrypt(ciphertext)
     w, Nr = _key_expansion(key)
     out = bytearray()
     prev_int = int.from_bytes(iv, "little")
@@ -470,6 +516,8 @@ def aes_ecb_decrypt(ciphertext, key):
         raise ValueError("AES key must be 16/24/32 bytes")
     if len(ciphertext) % 16 != 0:
         raise ValueError("ciphertext must be multiple of 16")
+    if _AES_C is not None:
+        return _AES_C.new(key, _AES_C.MODE_ECB).decrypt(ciphertext)
     w, Nr = _key_expansion(key)
     out = bytearray()
     for i in range(0, len(ciphertext), 16):
@@ -477,14 +525,14 @@ def aes_ecb_decrypt(ciphertext, key):
     return bytes(out)
 
 
-def pkcs7_unpad(data):
-    if not data:
-        return data
+def pkcs7_unpad(data, block_size=16):
+    """PKCS7 去填充（严格模式）：填充非法直接抛错——错误密钥的解密产物
+    不允许静默通过；空数据/长度非块对齐同样视为非法。"""
+    if not data or len(data) % block_size != 0:
+        raise ValueError("PKCS7 填充非法（数据为空或长度非块对齐）")
     pad = data[-1]
-    if pad < 1 or pad > 16:
-        return data
-    if data[-pad:] != bytes([pad]) * pad:
-        return data
+    if pad < 1 or pad > block_size or data[-pad:] != bytes([pad]) * pad:
+        raise ValueError("PKCS7 填充校验失败（密钥可能不匹配）")
     return data[:-pad]
 
 
@@ -550,6 +598,15 @@ def _try_aes_decrypt(data, rule):
     return out
 
 
+def _looks_like_xml(data, enabled=True):
+    """解密结果嗅探：容忍前导空白，检查 BOM / <?xml 声明。
+    enabled=False 时视为通过（verify_xml 配置关闭校验）。"""
+    if not enabled:
+        return True
+    head = data[:60].lstrip()
+    return bool(head[:3] == b"\xef\xbb\xbf" or b"<?xml" in head)
+
+
 def _decrypt_if_needed(basename, data, rules):
     """
     若 basename 命中某个解密规则且已启用并配置了密钥，则尝试 AES 解密。
@@ -565,10 +622,8 @@ def _decrypt_if_needed(basename, data, rules):
         out = _try_aes_decrypt(data, rule)
     except Exception as e:
         return data, False, f"解密失败：{e}（已按原样导出密文）"
-    if rule.get("verify_xml", True):
-        head = out[:60]
-        if not (head[:3] == b"\xef\xbb\xbf" or head[:5] == b"<?xml" or b"<?xml" in head):
-            return data, False, "解密校验失败：输出不是 XML，密钥/算法可能不正确（已按原样导出密文）"
+    if rule.get("verify_xml", True) and not _looks_like_xml(out):
+        return data, False, "解密校验失败：输出不是 XML，密钥/算法可能不正确（已按原样导出密文）"
     return out, True, None
 
 
@@ -580,6 +635,77 @@ def _decode_zip_name(zi):
         return zi.filename.encode("cp437").decode("gbk")
     except Exception:
         return zi.filename
+
+
+def _aqzf_pbzb_exts(rules):
+    """参与 AQZF-PBZB 解密的扩展名集合：内置 .18aqzb + decrypt_config.json
+    中 algorithm="AQZF-PBZB" 且 enabled 的规则键；显式 disabled 的内置项剔除。"""
+    exts = set(AQZF_ENCRYPTED_EXTS)
+    for ext, rule in (rules or {}).items():
+        if not isinstance(rule, dict) or rule.get("algorithm") != "AQZF-PBZB":
+            continue
+        if rule.get("enabled", True):
+            exts.add(ext.lower())
+        else:
+            exts.discard(ext.lower())
+    return exts
+
+
+def _parse_pbzb_zbinfo(text):
+    """从容器的 PBZB.xml 文本解析 ZBInfoMx 书签（多标段各自 EncryKey 全部收集）：
+    返回 (encry_keys, encry_flag)。属性顺序无关，找不到返回 ([], None)。"""
+    encry_keys = []
+    encry_flag = None
+    for tag_m in re.finditer(r"<ZBInfoMx\b[^>]*>", text):
+        tag = tag_m.group(0)
+        bm = re.search(r'BookMarkName="([^"]*)"', tag)
+        mv = re.search(r'MarkValue="([^"]*)"', tag)
+        if not bm or not mv:
+            continue
+        name, val = bm.group(1), mv.group(1).strip()
+        if name == "EncryKey":
+            if val and val not in encry_keys:
+                encry_keys.append(val)
+        elif name == "EncryQingDan" and encry_flag is None:
+            encry_flag = val
+    return encry_keys, encry_flag
+
+
+def _aqzf_pbzb_decrypt(data, encry_key):
+    """安庆 .AQZF 内层清单解密（单密钥）：
+    key = MD5(EncryKey) 前 8 / 后 8 字节轮换 → AES-128-ECB → PKCS7 去填充。
+    算法与新点官方「导出招标解密清单」产物逐字节一致（SHA-256 已实测比对）。
+    PKCS7 填充非法时，若解密结果本身已是 XML（官方密文未填充场景）则放行，
+    否则视为密钥不匹配抛错。"""
+    digest = hashlib.md5(encry_key.strip().encode("utf-8")).digest()
+    key = digest[8:] + digest[:8]
+    raw = aes_ecb_decrypt(data, key)
+    try:
+        return pkcs7_unpad(raw)
+    except ValueError:
+        if _looks_like_xml(raw):
+            return raw
+        raise
+
+
+def _aqzf_pbzb_decrypt_best(data, encry_keys):
+    """多密钥逐个尝试（多标段容器各标段密钥不同），返回 (明文, 命中密钥)；
+    全部失败抛出最后一次异常。"""
+    last_err = None
+    for encry_key in encry_keys:
+        try:
+            return _aqzf_pbzb_decrypt(data, encry_key), encry_key
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err is not None else ValueError("无可用 EncryKey")
+
+
+def _store_entry(target, data, zi):
+    """解密产物整体落盘并计算校验值，返回 (crc32, sha256_hex)。
+    解密后明文的 CRC 与 zip 条目记录（密文 CRC）天然不同，是否对账由调用方决定。"""
+    with open(target, "wb") as out:
+        out.write(data)
+    return zlib.crc32(data), hashlib.sha256(data).hexdigest()
 
 
 def _resolve_target(directory, base, used_names, overwrite, log=None):
@@ -1142,6 +1268,7 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                     os.makedirs(extract_dir)
 
                 rules, exclude = _load_decrypt_config()
+                aqzf_exts = _aqzf_pbzb_exts(rules)
 
                 extracted = []
                 warnings = 0
@@ -1152,6 +1279,23 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                 attachment_raw = []  # 容器内文本条目中的可下载链接
 
                 with zipfile.ZipFile(spool) as zf:
+                    # ---- 安庆 .AQZF：预扫 PBZB.xml 取清单解密密钥（EncryKey/EncryQingDan）。
+                    # 条目顺序无保证（PBZB.xml 可能排在加密清单之后），必须先扫一遍。
+                    # 多标段容器含多个 EncryKey（各标段独立），全部收集逐个尝试。
+                    pbzb_keys = []
+                    pbzb_flag = None
+                    if aqzf_exts:
+                        try:
+                            for zi2 in zf.infolist():
+                                if os.path.basename(_decode_zip_name(zi2)) == "PBZB.xml":
+                                    pbzb_keys, pbzb_flag = _parse_pbzb_zbinfo(
+                                        zf.read(zi2).decode("utf-8", "replace"))
+                                    break
+                        except CancelledError:
+                            raise
+                        except Exception as e:
+                            _log("AQZF PBZB.xml 预扫描失败", e)
+
                     for zi in zf.infolist():
                         if zi.is_dir():
                             continue
@@ -1195,8 +1339,56 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                             src_ext = os.path.splitext(base)[1].lower()
                             rule = rules.get(src_ext)
                             need_decrypt = bool(rule and rule.get("enabled") and rule.get("key"))
+                            # 安庆 .AQZF 内层清单：EncryQingDan 未明确为 "0"/"false"（未加密）
+                            # 时一律尝试解密——官方个别版本写 "true" 等其他真值，
+                            # 旧版会静默落盘密文；解密失败由分支内回退并告警。
+                            aqzf_decryptable = (
+                                src_ext in aqzf_exts and bool(pbzb_keys)
+                                and not (pbzb_flag and pbzb_flag in ("0", "false")))
+                            aqzf_verify_xml = (rule.get("verify_xml", True)
+                                               if isinstance(rule, dict) else True)
 
-                            if need_decrypt:
+                            if aqzf_decryptable:
+                                data = zf.read(zi)
+                                try:
+                                    out_data, key_used = _aqzf_pbzb_decrypt_best(data, pbzb_keys)
+                                    if not _looks_like_xml(out_data, aqzf_verify_xml):
+                                        raise ValueError("解密结果不是 XML（密钥可能不匹配）")
+                                    log(f"  🔓 {base}: AQZF 清单解密成功"
+                                        f"（MD5(EncryKey) 轮换 → AES-128-ECB，来自 PBZB.xml"
+                                        + (f"，多标段命中第 {pbzb_keys.index(key_used) + 1}"
+                                           f"/{len(pbzb_keys)} 个密钥" if len(pbzb_keys) > 1 else "")
+                                        + "）")
+                                except CancelledError:
+                                    raise
+                                except Exception as e:
+                                    # 回退：原样导出原始内容，不拦截条目
+                                    out_data = data
+                                    log(f"  ⚠ {base}: AQZF 清单解密失败：{e}"
+                                        f"（已按原样导出）")
+                                    warnings += 1
+                                crc, sha_hex = _store_entry(target, out_data, zi)
+                            elif src_ext in aqzf_exts and not pbzb_keys:
+                                # 未找到 EncryKey：容器可能未加密清单或非安庆系，原样导出并提示
+                                hasher = hashlib.sha256()
+                                crc = 0
+                                with zf.open(zi) as src, open(target, "wb") as out:
+                                    while True:
+                                        chunk = src.read(1 << 20)
+                                        if not chunk:
+                                            break
+                                        out.write(chunk)
+                                        crc = zlib.crc32(chunk, crc)
+                                        hasher.update(chunk)
+                                if crc != (zi.CRC & 0xFFFFFFFF):
+                                    raise ValueError(
+                                        f"CRC 校验失败（zip 记录 {zi.CRC:08X}，实际 {crc:08X}）："
+                                        "解压数据已损坏")
+                                sha_hex = hasher.hexdigest()
+                                log(f"  ⚠ {base}: 容器内未见 PBZB.xml EncryKey，"
+                                    f"无法解密，已按原样导出密文")
+                                warnings += 1
+                            elif need_decrypt:
                                 data = zf.read(zi)
                                 out_data, decrypted, warn = _decrypt_if_needed(base, data, rules)
                                 if warn:
@@ -1204,14 +1396,13 @@ def extract_file(filepath, overwrite=True, log=None, registry=None, learned=None
                                     warnings += 1
                                 if decrypted:
                                     log(f"  🔓 {base}: AES 解密成功")
-                                crc = zlib.crc32(out_data)
+                                crc, sha_hex = _store_entry(target, out_data, zi)
+                                # 通用 AES 分支：解密产物 CRC 与 zip 记录（密文）对不上
+                                # 即说明明文被篡改/密钥算法错误，拦截该条目
                                 if crc != (zi.CRC & 0xFFFFFFFF):
                                     raise ValueError(
                                         f"CRC 校验失败（zip 记录 {zi.CRC:08X}，实际 {crc:08X}）："
                                         "解密产物与源文件不符，可能密钥/算法不正确")
-                                sha_hex = hashlib.sha256(out_data).hexdigest()
-                                with open(target, "wb") as out:
-                                    out.write(out_data)
                             else:
                                 hasher = hashlib.sha256()
                                 crc = 0
@@ -1374,25 +1565,50 @@ except Exception:
     TkinterDnD = None
     DND_FILES = None
 
-# ---- 视觉规范（Hermes Teal 风格：深 teal 暗底 + 奶油文字 + 琥珀强调 + 终端气质）----
+# ---- 视觉规范：双主题（ZB TEAL 暗色 / ZB LIGHT 浅色），同源设计语言 ----
+# 深色底 + 奶油/墨色文字 + 琥珀强调 + 发丝边框 + 描边按钮（语义色对齐 Hermes）
 # 字体：MiSans（小米，免费商用可分发，随包内置）；等宽场景用系统 Consolas（仅 ASCII）
 FONT = "微软雅黑"        # 由 _load_bundled_fonts() 覆写
 FONT_MONO = "Consolas"
-BG = "#041c1c"        # 页面背景（深 teal）
-SIDEBAR = "#021414"   # 侧栏（更深一档）
-CARD = "#072727"      # 卡片背景
-BORDER = "#154341"    # 发丝边框
-FG = "#ffe6cb"        # 主文字（奶油）
-MUTED = "#a79f8d"     # 次要文字（奶油 65%，同 Hermes text-tertiary）
-DIM = "#74837d"       # 更暗的辅助文字
-ACCENT = "#ffac02"    # 主色（琥珀，同 Hermes midground）
-ACCENT_DARK = "#cc8a02"
-SELECT_BG = "#0f3a38" # 列表选中底色
-SUCCESS = "#4ade80"
-DANGER = "#fb2c36"
-WARN = "#ffbd38"
-STATUSBAR = "#021212"
-LOG_BG = "#021919"
+
+THEMES = {
+    "zb-teal": dict(
+        BG="#041c1c", SIDEBAR="#021414", CARD="#072727", BORDER="#154341",
+        FG="#ffe6cb", MUTED="#a79f8d", DIM="#74837d",
+        ACCENT="#ffac02", ACCENT_DARK="#cc8a02", SELECT_BG="#0f3a38",
+        SUCCESS="#4ade80", DANGER="#fb2c36", WARN="#ffbd38",
+        STATUSBAR="#021212", LOG_BG="#021919",
+        PRIMARY_FG="#1c1000", PRIMARY_DISABLED_BG="#5e4408",
+        DANGER_FG="#ff9c9c", DANGER_BORDER="#5e2624",
+    ),
+    "zb-light": dict(
+        BG="#f3efe6", SIDEBAR="#eae5d6", CARD="#faf8f1", BORDER="#d8d1bd",
+        FG="#1f2a26", MUTED="#707a72", DIM="#9aa39b",
+        ACCENT="#e08900", ACCENT_DARK="#b56f00", SELECT_BG="#e6dfcb",
+        SUCCESS="#15803d", DANGER="#dc2626", WARN="#b45309",
+        STATUSBAR="#e9e4d6", LOG_BG="#f7f4ec",
+        PRIMARY_FG="#231300", PRIMARY_DISABLED_BG="#eadbb8",
+        DANGER_FG="#b91c1c", DANGER_BORDER="#e3b7b3",
+    ),
+}
+THEME_LABELS = {"zb-teal": "ZB TEAL", "zb-light": "ZB LIGHT"}
+
+
+def _apply_theme(name):
+    """把主题 token 写入模块全局（BG/FG/...），供样式与控件构建时读取。
+    未知主题名回退 zb-teal。FONT 不随主题变化（由字体加载器决定）。"""
+    t = THEMES.get(name) or THEMES["zb-teal"]
+    globals().update(t)
+
+
+def _current_theme_name():
+    for name in THEMES:
+        if globals().get("BG") == THEMES[name]["BG"]:
+            return name
+    return "zb-teal"
+
+
+_apply_theme("zb-teal")  # 导入即有完整默认色板（随后按配置可切换）
 
 
 def _load_bundled_fonts():
@@ -1485,19 +1701,28 @@ def _setup_style(root):
               background=[("pressed", SELECT_BG), ("active", SELECT_BG)],
               bordercolor=[("active", ACCENT)],
               foreground=[("disabled", DIM), ("active", ACCENT)])
-    # 主按钮（琥珀大按钮：深色文字，与暗底形成强对比）
-    style.configure("Primary.TButton", background=ACCENT, foreground="#1c1000",
+    # 主按钮（琥珀大按钮：深色文字，与底色形成强对比）
+    style.configure("Primary.TButton", background=ACCENT, foreground=PRIMARY_FG,
                     padding=(22, 8), borderwidth=1, relief="solid",
                     bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
                     font=(FONT, 11, "bold"))
     style.map("Primary.TButton",
-              background=[("disabled", "#5e4408"), ("pressed", "#ffbd38"), ("active", "#ffbd38")],
-              foreground=[("disabled", "#0d2925")])
+              background=[("disabled", PRIMARY_DISABLED_BG), ("pressed", WARN), ("active", WARN)],
+              foreground=[("disabled", BG)])
     # 危险动作（描边转红）
-    style.configure("Danger.TButton", bordercolor="#5e2624", foreground="#ff9c9c")
+    style.configure("Danger.TButton", bordercolor=DANGER_BORDER, foreground=DANGER_FG)
     style.map("Danger.TButton",
               bordercolor=[("active", DANGER)],
               foreground=[("active", DANGER), ("disabled", DIM)])
+    # 主题切换按钮（侧栏底部，明暗互换）
+    style.configure("Theme.TButton", background=SIDEBAR, foreground=ACCENT,
+                    padding=(8, 3), borderwidth=1, relief="solid",
+                    bordercolor=BORDER, lightcolor=SIDEBAR, darkcolor=SIDEBAR,
+                    font=(FONT_MONO, 8, "bold"))
+    style.map("Theme.TButton",
+              background=[("pressed", SELECT_BG), ("active", SELECT_BG)],
+              bordercolor=[("active", ACCENT)],
+              foreground=[("active", ACCENT)])
     # 附件行内小按钮（紧凑描边）
     style.configure("Row.TButton", background=CARD, foreground=FG,
                     padding=(9, 3), borderwidth=1, relief="solid",
@@ -1611,6 +1836,10 @@ class ExtractTool:
         self.registry, self.learned = _load_registry()
 
         cfg = _load_ui_config()
+        self.theme = cfg.get("theme") if cfg.get("theme") in THEMES else "zb-light"
+        _apply_theme(self.theme)
+        _setup_style(self.root)
+        self.root.configure(background=BG)
         self.overwrite_var = tk.BooleanVar(value=bool(cfg.get("overwrite", True)))
         self.open_dir_var = tk.BooleanVar(value=bool(cfg.get("open_dir", False)))
         self.checksum_var = tk.BooleanVar(value=bool(cfg.get("checksum", True)))
@@ -1633,7 +1862,7 @@ class ExtractTool:
         statusbar.pack_propagate(False)
         ttk.Label(statusbar, textvariable=self.status_text,
                   style="Status.TLabel").pack(side=tk.LEFT, padx=12)
-        ttk.Label(statusbar, text=f"ZB TEAL · {APP_VERSION}",
+        ttk.Label(statusbar, text=f"{THEME_LABELS[self.theme]} · {APP_VERSION}",
                   style="Status.TLabel",
                   font=(FONT_MONO, 8)).pack(side=tk.RIGHT, padx=12)
 
@@ -1660,9 +1889,11 @@ class ExtractTool:
         tk.Frame(rail, background=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(10, 10))
         rail_bottom = tk.Frame(rail, background=SIDEBAR)
         rail_bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
-        ttk.Label(rail_bottom, text="● ZB TEAL", style="Badge.TLabel").pack(anchor="w", padx=14)
+        self.btn_theme = ttk.Button(rail_bottom, text=f"● {THEME_LABELS[self.theme]}",
+                                    style="Theme.TButton", command=self._toggle_theme)
+        self.btn_theme.pack(anchor="w", padx=14)
         ttk.Label(rail_bottom, text=f"{APP_VERSION} · *zf/*cf",
-                  style="RailVer.TLabel").pack(anchor="w", padx=14, pady=(2, 0))
+                  style="RailVer.TLabel").pack(anchor="w", padx=14, pady=(4, 0))
         # 侧栏右发丝分隔线
         tk.Frame(self.root, background=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
@@ -1854,6 +2085,58 @@ class ExtractTool:
             self.files.append(p)
             self.file_listbox.insert(tk.END, os.path.basename(p))
         self._refresh_list_ui()
+
+    def _toggle_theme(self):
+        """切换明/暗主题：持久化选择后重建界面（附件下载状态/文件列表保留）。"""
+        self.theme = "zb-light" if self.theme == "zb-teal" else "zb-teal"
+        self._persist_theme()
+        self._rebuild_for_theme()
+
+    def _rebuild_for_theme(self):
+        """应用新主题并原地重建窗口内容。
+
+        快照并恢复：文件列表、附件行下载状态（gid/进度/错误，进行中任务
+        由轮询线程继续跟踪）、日志内容；解压进行中的按钮状态同步。"""
+        _apply_theme(self.theme)
+        _setup_style(self.root)
+        files = list(self.files)
+        attachments = list(self.attachments)
+        rows = {}
+        for idx, r in self.attach_rows.items():
+            rows[idx] = {k: r.get(k) for k in
+                         ("state", "gid", "error", "status_text",
+                          "pct", "speed", "total", "done")}
+        log_text = ""
+        try:
+            log_text = self.log_text.get("1.0", "end-1c")
+        except Exception:
+            pass
+        for w in self.root.winfo_children():
+            w.destroy()
+        self._build_ui()
+        self.log_text.insert("1.0", log_text)
+        self.files = files
+        self.attachments = attachments
+        if attachments:
+            self._populate_attachments()
+            for idx, snap in rows.items():
+                row = self.attach_rows.get(idx)
+                if not row:
+                    continue
+                row.update({k: v for k, v in snap.items() if v is not None})
+                self._render_attach_row(idx)
+        else:
+            self.attach_hint.pack_forget()
+            self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
+        self._refresh_list_ui()
+        if self.is_running:
+            self.btn_extract.config(text="解压中…", state=tk.DISABLED)
+            self.btn_cancel.config(state=tk.NORMAL)
+
+    def _persist_theme(self):
+        cfg = _load_ui_config()
+        cfg["theme"] = self.theme
+        _save_ui_config(cfg)
 
     def _refresh_list_ui(self):
         """刷新计数徽标与空列表提示。"""
@@ -2518,6 +2801,9 @@ class AutoRunner:
         self.registry, self.learned = _load_registry()
 
         self.root = make_root()
+        _cfg_ui = _load_ui_config()
+        _apply_theme(_cfg_ui.get("theme") if _cfg_ui.get("theme") in THEMES else "zb-light")
+        _setup_style(self.root)
         self.root.title(f"招标文件快速解压工具 {APP_VERSION} - 自动解压")
         self.root.geometry("620x340")
         self.root.configure(background=BG)

@@ -1,6 +1,7 @@
 {
-  "_说明": "招标文件解压工具 解密配置（v1.2）。修改后无需重启，下次解压时自动读取。",
+  "_说明": "招标文件解压工具 解密配置（v3.0）。修改后无需重启，下次解压时自动读取。",
   "_用法": "把 enabled 改为 true 并填入官方软件中的 AES 密钥；verify_xml 会在解密结果不是 XML 时自动回退为导出密文并告警。",
+  "_AQZF-PBZB": "安庆 .AQZF 容器内层清单专用算法：无需填密钥，运行时自动从容器内 PBZB.xml 读取全部 ZBInfoMx EncryKey（多标段逐个尝试）并按 MD5 前8/后8字节轮换 → AES-128-ECB/PKCS7 解密；EncryQingDan 除 \"0\"/\"false\"（未加密）外均尝试解密，verify_xml=false 可关闭解密结果 XML 校验。默认已启用 .18aqzb；可用该算法为其它内层格式（如 .18aqkz）开启，或对 .18aqzb 设 enabled=false 关闭。",
   "exclude_files": [
     "PBZB.xml"
   ],
@@ -15,6 +16,11 @@
       "iv": "",
       "iv_from_ciphertext": false,
       "strip_pkcs7": true,
+      "verify_xml": true
+    },
+    ".18aqzb": {
+      "enabled": true,
+      "algorithm": "AQZF-PBZB",
       "verify_xml": true
     }
   }

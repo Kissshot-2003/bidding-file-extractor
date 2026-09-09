@@ -15,6 +15,7 @@
 - **后台线程**：解压不阻塞界面，日志/进度实时刷新
 - **防炸弹**：解压总量上限（默认 2 GB，可用环境变量 `EXTRACT_MAX_SIZE` 覆盖）
 - **可插拔 AES 解密钩子**：通过 `decrypt_config.json` 配置密钥解密加密容器（默认关闭，密钥为空）
+- **安庆 .AQZF 内层清单自动解密（v3.0，v3.1 增强）**：安庆平台 `.AQZF` 容器内的 `.18aqzb` 清单为加密存储，直接解压会得到密文、官方软件打开报错。工具自动读取容器内 `PBZB.xml` 的 `ZBInfoMx EncryKey`，按「MD5(EncryKey) 前8/后8字节轮换 → AES-128‑ECB/PKCS7」解密，产物与官方工具「导出招标解密清单」逐字节一致。其它同机制内层格式可在 `decrypt_config.json` 以 `algorithm: "AQZF-PBZB"` 规则启用。v3.1 起：**多标段容器**收集全部 EncryKey 逐个尝试（日志标明命中第几个密钥）；`EncryQingDan` 除明确 `"0"/"false"` 外均尝试解密（`"true"` 等值不再静默落盘密文）；PKCS7 填充严格校验，错误密钥无法蒙混过关；AES 优先 pycryptodome（未安装回退内置纯 Python 实现），大清单解密提速万倍
 
 ## 使用方式
 
@@ -62,16 +63,16 @@
 ## 开发与测试
 
 ```
-python test_extract_tool.py   # 单元测试（30+ 用例）
+python test_extract_tool.py   # 单元测试（60+ 用例）
 ```
 
 打包（v2.8 起需先确认 `fonts/` 目录有 MiSans 字体，spec 会内嵌进 exe）：
 
 ```
-pyinstaller --noconfirm --clean 招标文件快速解压工具_v2.8.spec
+pyinstaller --noconfirm --clean 招标文件快速解压工具_v3.1.spec
 ```
 
-依赖：Python 3.10+（标准库，可选 `tkinterdnd2` 提供窗口拖放）。
+依赖：Python 3.10+（标准库，可选 `tkinterdnd2` 提供窗口拖放；可选 `pycryptodome` 加速 AES 解密，未安装回退内置纯 Python 实现）。
 
 ## 许可
 
