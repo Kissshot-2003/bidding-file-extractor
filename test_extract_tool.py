@@ -510,44 +510,24 @@ class CliHelperTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_build_motrix_deeplink_single(self):
-        link = et._build_motrix_deeplink(["http://114.98.87.113:9016/TPBidder/file.rar"])
-        self.assertTrue(link.startswith("motrix://new-task?uri="))
-        from urllib.parse import unquote, urlparse, parse_qs
-        u = urlparse(link)
-        self.assertEqual(u.hostname, "new-task")
-        qs = parse_qs(u.query)
-        self.assertIn("uri", qs)
-        self.assertEqual(unquote(qs["uri"][0]).strip(),
-                         "http://114.98.87.113:9016/TPBidder/file.rar")
+    def test_aria2c_path_found(self):
+        # 源码/打包运行都应能定位内置 aria2c；找不到时返回 None（不抛异常）
+        p = et._aria2c_path()
+        if p is not None:
+            self.assertTrue(os.path.isfile(p))
 
-    def test_build_motrix_deeplink_batch(self):
-        urls = ["https://a.example.com/x.zip?k=1&tag=图纸", "https://b.example.com/y.rar"]
-        link = et._build_motrix_deeplink(urls)
-        self.assertTrue(link.startswith("motrix://new-task?uri="))
-        from urllib.parse import unquote, urlparse, parse_qs
-        u = urlparse(link)
-        self.assertEqual(u.hostname, "new-task")
-        decoded = unquote(parse_qs(u.query)["uri"][0])
-        parts = decoded.split("\n")
-        self.assertEqual(parts, urls)  # 换行分隔、顺序一致、& 未被破坏
-        for p in parts:
-            self.assertTrue(p.startswith("http"))  # Motrix fW() 校验开头协议
-
-    def test_build_motrix_deeplink_empty(self):
-        self.assertIsNone(et._build_motrix_deeplink([]))
-        self.assertIsNone(et._build_motrix_deeplink(["", "   "]))
-
-    def test_build_motrix_deeplink_filters_blank(self):
-        link = et._build_motrix_deeplink(["  https://a.example.com/z.zip  ", ""])
-        from urllib.parse import unquote, urlparse, parse_qs
-        decoded = unquote(parse_qs(urlparse(link).query)["uri"][0])
-        self.assertEqual(decoded, "https://a.example.com/z.zip")
-
-    def test_motrix_protocol_available(self):
-        # 真实环境：安装了 Motrix 则为 True；无论如何不抛异常
-        result = et._motrix_protocol_available()
-        self.assertIsInstance(result, bool)
+    def test_aria2_engine_start_and_stop(self):
+        # 内置引擎可真实拉起并通过 RPC 查询版本；结束后必须能干净关闭
+        if et._aria2c_path() is None:
+            self.skipTest("未找到内置 aria2c.exe")
+        try:
+            endpoint = et._ensure_aria2_engine()
+            self.assertIsNotNone(endpoint)
+            port, secret = endpoint
+            version = et._aria2_rpc(port, secret, "aria2.getVersion", timeout=5)
+            self.assertIn("version", version)
+        finally:
+            et._stop_aria2_engine()
 
     def test_fmt_size_and_speed(self):
         self.assertEqual(et._fmt_size(0), "0 B")
@@ -557,9 +537,9 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(et._fmt_speed(0), "0 B/s")
         self.assertEqual(et._fmt_speed(1024 * 1024), "1.0 MB/s")
 
-    def test_motrix_rpc_endpoint_shape(self):
-        # 有 Motrix 配置则返回 (端口, 令牌) 二元组；无配置返回 None；不抛异常
-        endpoint = et._motrix_rpc_endpoint()
+    def test_aria2_rpc_endpoint_shape(self):
+        # 引擎未启动时返回 None；启动后返回 (端口, 令牌) 二元组；不抛异常
+        endpoint = et._aria2_rpc_endpoint()
         if endpoint is not None:
             port, secret = endpoint
             self.assertIsInstance(port, int)

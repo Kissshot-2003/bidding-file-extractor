@@ -4,6 +4,15 @@
 .szcf, .tlcf，以及任何字母/数字前缀（如 .xdzf、.2026cf）——只要扩展名以 zf 或 cf 结尾
 支持格式学习更新：成功解压未知格式后自动记忆，下次选择文件时自动包含
 
+v3.3 变更：
+  - 下载引擎内置化：不再依赖 Motrix——程序自带 aria2c.exe（随包内嵌），
+    首次下载时自动拉起本地 aria2 引擎并通过 JSON-RPC 无头控制（不弹外部
+    窗口、任务自动开始）；退出时自动关闭引擎，无需用户安装任何第三方下载器
+  - 合并「选择文件」「选择文件夹」为单一「添加文件 / 文件夹」按钮：点开
+    对话框可多选文件、可多次选择多个文件夹，确定后程序自动递归搜索所选
+    文件夹内全部可解压（*zf / *cf）文件并统一加入列表
+  - 移除 Motrix 相关检测与 motrix:// 深度链接逻辑
+
 v3.1 变更：
   - 修复：安庆 .AQZF 多标段容器——此前仅取 PBZB.xml 最后一个 EncryKey，
     多标段（各标段密钥不同）会解不开；现收集全部密钥逐个尝试，
@@ -246,7 +255,7 @@ FORMAT_REGISTRY = os.path.join(CONFIG_DIR, "format_registry.json")
 DECRYPT_CONFIG = os.path.join(CONFIG_DIR, "decrypt_config.json")
 UI_CONFIG = os.path.join(CONFIG_DIR, "ui_config.json")
 LOG_MAX_BYTES = 1 << 20
-APP_VERSION = "v3.1"
+APP_VERSION = "v3.3"
 BUILTIN_FORMATS = {"zf": "ZBFileContent", "cf": "DYFileContent"}
 # 已知常见格式（用于文件对话框精确列出）；实际接受范围更广，见 _is_supported_ext()
 BUILTIN_EXTENSIONS = ["zf", "cf", "aqzf", "tlzf", "hnzf", "czzf", "sczf", "xizf", "szcf", "tlcf"]
@@ -265,7 +274,7 @@ KNOWN_ENCRYPTED_EXTS = {".ahaqslzb"}
 # 安庆新点 J 系列容器（.AQZF 等）内加密清单的默认扩展名：
 # PBZB.xml ZBInfoMx EncryQingDan="1" 时，内层清单以
 # 「MD5(EncryKey) 前8/后8字节轮换 → AES-128-ECB/PKCS7」加密存储。
-AQZF_ENCRYPTED_EXTS = {".18aqzb"}
+AQZF_ENCRYPTED_EXTS = {".18aqzb", ".ahaqslzb"}
 # 单次解压总量上限（字节），防 zip 炸弹；可通过环境变量 EXTRACT_MAX_SIZE 覆盖。
 MAX_TOTAL_SIZE = int(os.environ.get("EXTRACT_MAX_SIZE", 2 * 1024 ** 3))  # 默认 2GB
 
@@ -819,7 +828,7 @@ def _download_attachment(url, target_dir, name, log=None):
     ctype = (resp.headers.get("Content-Type") or "").lower()
     body_head = resp.read(8 if "text/html" in ctype else 32)
     if "text/html" in ctype:
-        raise ValueError("服务器返回网页（可能需要浏览器会话/身份验证），请改用 Motrix 或浏览器打开")
+        raise ValueError("服务器返回网页（可能需要浏览器会话/身份验证），请用「浏览器」打开")
 
     fname = _safe_filename(name) or "download"
     os.makedirs(target_dir, exist_ok=True)
@@ -853,33 +862,71 @@ def _safe_filename(name):
 
 
 # ---------------------------------------------------------------------------
-# Motrix 下载器集成（motrix:// 深度链接，Motrix 2.x 官方协议格式）
+# 内置 aria2 下载引擎（自带 aria2c.exe，程序自行拉起 + JSON-RPC 无头控制）
 # ---------------------------------------------------------------------------
-def _motrix_protocol_available():
-    """检测系统是否已注册 motrix:// 协议（安装 Motrix 后自动注册）。"""
-    if os.name != "nt":
-        return False
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "motrix"):
-            return True
-    except OSError:
-        return False
+_ARIA2_STATE = {"proc": None, "port": None, "secret": None}
+_ARIA2_LOCK = threading.Lock()
+_ARIA2_READY_TIMEOUT = 15
 
 
-def _build_motrix_deeplink(urls):
-    """把一条或多条下载链接组装为 motrix:// 深度链接。
+def _aria2c_path():
+    """定位内置 aria2c 可执行文件。
 
-    Motrix 2.x 协议格式：motrix://new-task?uri=<URL编码后的链接>
-    （uri 须以 http/https/ftp/magnet 开头）；多条链接以换行合并可
-    在 Motrix「新建任务」窗口一次性批量预填（每行一条）。
-    返回深度链接字符串；urls 全为空时返回 None。
+    优先 exe 内嵌资源目录（PyInstaller onefile 解包到 sys._MEIPASS），
+    其次程序/源码所在目录，最后回退系统 PATH。找不到返回 None。
     """
-    from urllib.parse import quote
-    lines = [u.strip() for u in urls if u and u.strip()]
-    if not lines:
-        return None
-    return "motrix://new-task?uri=" + quote("\n".join(lines), safe="")
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "aria2c.exe"))
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), "aria2c.exe"))
+    candidates.append(os.path.join(APP_DIR, "aria2c.exe"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("aria2c")
+
+
+def _aria2_rpc_endpoint():
+    """返回内置引擎的 (端口, 令牌)；引擎尚未启动时返回 None。"""
+    if _ARIA2_STATE.get("port") and _ARIA2_STATE.get("secret") is not None:
+        return int(_ARIA2_STATE["port"]), str(_ARIA2_STATE["secret"])
+    return None
+
+
+def _aria2_proc_alive():
+    """内置引擎进程是否存活。"""
+    proc = _ARIA2_STATE.get("proc")
+    return proc is not None and proc.poll() is None
+
+
+def _pick_free_port():
+    """向系统申请一个空闲端口，作为内置引擎的 RPC 监听端口。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+def _stop_aria2_engine():
+    """终止内置 aria2 引擎并清空状态（程序退出时调用）。"""
+    with _ARIA2_LOCK:
+        proc = _ARIA2_STATE.get("proc")
+        _ARIA2_STATE.update(proc=None, port=None, secret=None)
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
 
 
 def _fmt_size(n):
@@ -902,44 +949,12 @@ def _fmt_speed(speed):
     return "0 B/s"
 
 
-def _motrix_rpc_endpoint():
-    """读取 Motrix 本地设置，返回 (rpc端口, rpc令牌)；读取失败返回 None。
-
-    Motrix 2.x 把引擎 RPC 端口与令牌持久化在 %APPDATA%/Motrix/settings.json，
-    与其 aria2 引擎实际启动参数一致，可用于本地 JSON-RPC 无头直控。"""
-    path = os.path.join(os.environ.get("APPDATA", ""), "Motrix", "settings.json")
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-        engine = cfg.get("engine") or {}
-        port = int(engine.get("rpcPort") or 16800)
-        secret = str(engine.get("rpcSecret") or "")
-        return port, secret
-    except Exception:
-        return None
-
-
-def _motrix_exe_path():
-    """从系统注册的 motrix:// 协议命令行解析 Motrix.exe 安装路径。"""
-    if os.name != "nt":
-        return None
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"motrix\shell\open\command") as k:
-            cmd = (winreg.QueryValueEx(k, "")[0] or "").strip()
-        if cmd.startswith('"'):
-            return cmd.split('"', 2)[1]
-        return cmd.split(" ", 1)[0]
-    except Exception:
-        return None
-
-
 def _aria2_rpc(port, secret, method, params=None, timeout=6):
-    """调用 Motrix 内置 aria2 的 JSON-RPC。成功返回 result，失败抛异常。
+    """调用内置 aria2 的 JSON-RPC。成功返回 result，失败抛异常。
 
     端点 http://127.0.0.1:<port>/jsonrpc；令牌以 "token:<secret>" 作为
-    第一个参数（secret 为空时不带令牌）。注意 Motrix 定制版 aria2 对
-    JSON-RPC 业务错误（如 GID 不存在）返回 HTTP 400，错误详情在响应体。"""
+    第一个参数（secret 为空时不带令牌）。aria2 对 JSON-RPC 业务错误
+    （如 GID 不存在）返回 HTTP 400，错误详情在响应体。"""
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
     payload = json.dumps({
@@ -959,75 +974,118 @@ def _aria2_rpc(port, secret, method, params=None, timeout=6):
         except Exception:
             data = None
         message = (data or {}).get("error", {}).get("message") if data else None
-        raise RuntimeError(message or f"Motrix RPC HTTP {e.code}")
+        raise RuntimeError(message or f"aria2 RPC HTTP {e.code}")
     data = json.loads(body)
     if data.get("error"):
         raise RuntimeError(str((data["error"] or {}).get("message") or "RPC 错误"))
     return data.get("result")
 
 
-def _motrix_ensure_engine(port, secret, wait_seconds=30, log=None):
-    """确保 Motrix aria2 引擎可用：已在运行直接返回 True；否则拉起
-    Motrix 并轮询 RPC 就绪（默认最长等待 30 秒）。"""
+def _ensure_aria2_engine(log=None):
+    """确保内置 aria2 引擎可用：已就绪直接返回 (port, secret)；否则拉起
+    内置 aria2c.exe 并轮询 RPC 就绪（默认最长 15 秒）。失败返回 None。"""
     import time
+    import atexit
+    import subprocess
 
-    def probe():
+    endpoint = _aria2_rpc_endpoint()
+    if endpoint and _aria2_proc_alive():
+        try:
+            _aria2_rpc(endpoint[0], endpoint[1], "aria2.getVersion", timeout=2)
+            return endpoint
+        except Exception:
+            pass
+
+    exe = _aria2c_path()
+    if not exe:
+        if log:
+            log("✗ 未找到内置 aria2c.exe（请将其与程序放在同一目录）")
+        return None
+
+    with _ARIA2_LOCK:
+        endpoint = _aria2_rpc_endpoint()
+        if endpoint and _aria2_proc_alive():
+            return endpoint
+        port = _pick_free_port()
+        secret = hashlib.sha256(
+            ("%d-%s" % (port, time.time())).encode("utf-8")).hexdigest()[:32]
+        data_dir = os.path.join(CONFIG_DIR, "aria2")
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+        except Exception:
+            data_dir = tempfile.gettempdir()
+        args = [
+            exe,
+            "--enable-rpc",
+            "--rpc-listen-all=false",
+            "--rpc-listen-port=%d" % port,
+            "--rpc-secret=%s" % secret,
+            "--continue=true",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=true",
+            "--file-allocation=none",
+            "--max-concurrent-downloads=5",
+            "--max-connection-per-server=8",
+            "--split=8",
+            "--min-split-size=1M",
+            "--summary-interval=0",
+            "--quiet=true",
+            "--no-conf=true",
+            "--dir=%s" % data_dir,
+        ]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | \
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+        try:
+            proc = subprocess.Popen(
+                args, cwd=os.path.dirname(exe), creationflags=flags,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except Exception as e:
+            if log:
+                log(f"✗ 启动内置下载引擎失败: {e}")
+            return None
+        _ARIA2_STATE.update(proc=proc, port=port, secret=secret)
+
+    if log:
+        log("🚀 已启动内置下载引擎（aria2）")
+    deadline = time.time() + _ARIA2_READY_TIMEOUT
+    while time.time() < deadline:
         try:
             _aria2_rpc(port, secret, "aria2.getVersion", timeout=2)
-            return True
+            atexit.register(_stop_aria2_engine)
+            return port, secret
         except Exception:
-            return False
-
-    if probe():
-        return True
-    exe = _motrix_exe_path()
-    if not exe or not os.path.exists(exe):
-        if log:
-            log("✗ 未找到 Motrix 安装路径（motrix:// 协议未注册），无法自动启动")
-        return False
-    try:
-        import subprocess
-        subprocess.Popen([exe], cwd=os.path.dirname(exe),
-                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
-        if log:
-            log("🚀 Motrix 未运行，已自动启动，等待下载引擎就绪…")
-    except Exception as e:
-        if log:
-            log(f"✗ 自动启动 Motrix 失败: {e}")
-        return False
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        time.sleep(0.8)
-        if probe():
-            return True
+            if not _aria2_proc_alive():
+                break
+            time.sleep(0.4)
     if log:
-        log("✗ 等待 Motrix 下载引擎超时（可在 Motrix 设置中检查 RPC 端口）")
-    return False
+        log("✗ 内置下载引擎启动超时")
+    _stop_aria2_engine()
+    return None
 
 
-def _motrix_add_download(url, save_dir, filename, log=None, resume=True, referer=None):
-    """无头添加下载任务到 Motrix（不弹窗、自动开始）。成功返回 aria2 gid。
+def _aria2_add_download(url, save_dir, filename, log=None, resume=True, referer=None):
+    """无头添加下载任务到内置 aria2 引擎（不弹窗、自动开始）。成功返回 gid。
 
-    本地 RPC addUri：dir=附件归属项目输出目录，out=清洗后的文件名；
-    allow-overwrite 保证可覆盖旧文件；resume=True（首次提交）尝试续传
-    旧的部分文件，resume=False（「重新下载」）强制全新下载——对不支持
-    Range 续传的服务器也能成功；referer 用于平台防盗链校验。"""
-    endpoint = _motrix_rpc_endpoint()
+    dir=附件归属项目输出目录，out=清洗后的文件名；allow-overwrite 保证可
+    覆盖旧文件；resume=True（首次提交）尝试续传旧的部分文件，resume=False
+    （「重新下载」）强制全新下载——对不支持 Range 续传的服务器也能成功；
+    referer 用于平台防盗链校验。"""
+    endpoint = _ensure_aria2_engine(log=log)
     if not endpoint:
-        raise RuntimeError("未找到 Motrix 配置（请先启动一次 Motrix）")
+        raise RuntimeError("内置下载引擎未就绪（请确认 aria2c.exe 与程序同目录）")
     port, secret = endpoint
-    if not _motrix_ensure_engine(port, secret, log=log):
-        raise RuntimeError("Motrix 下载引擎未就绪（已尝试自动启动 Motrix）")
     opts = {"dir": save_dir, "out": filename,
             "user-agent": DEFAULT_UA,
             "allow-overwrite": "true",
+            "auto-renaming": "false",
             "continue": "true" if resume else "false"}
     if referer:
         opts["referer"] = referer
     return str(_aria2_rpc(port, secret, "aria2.addUri", [[url], opts]))
 
 
-def _motrix_task_status(port, secret, gid):
+def _aria2_task_status(port, secret, gid):
     """查询 aria2 任务状态，返回简化 dict（原始状态、进度字节、速度、错误）。"""
     st = _aria2_rpc(port, secret, "aria2.tellStatus",
                     [gid, ["status", "completedLength", "totalLength",
@@ -1115,7 +1173,7 @@ def _resolve_attachment_url(url, log=None):
             ctype = resp.headers.get("Content-Type")
     except Exception as e:
         if log:
-            log(f"⚠ 链接预检失败（仍按原链接提交 Motrix）: {e}")
+            log(f"⚠ 链接预检失败（仍按原链接提交）: {e}")
         return url
     if not _looks_like_html(head, ctype):
         return url
@@ -1818,6 +1876,204 @@ def _save_ui_config(cfg):
         pass
 
 
+def _pick_folders_multi(parent_hwnd=0):
+    """调用 Windows 原生「选择文件夹」对话框，支持一次多选多个文件夹。
+
+    通过 COM 的 IFileOpenDialog（FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT）
+    实现——Tk 自带的 askdirectory 一次只能选一个目录。返回选中目录列表；
+    用户取消返回 []；非 Windows 或调用失败返回 None（由调用方回退单目录选择）。
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    ole32 = ctypes.oledll.ole32
+    FOS_PICKFOLDERS = 0x20
+    FOS_FORCEFILESYSTEM = 0x40
+    FOS_ALLOWMULTISELECT = 0x200
+    SIGDN_FILESYSPATH = 0x80058000
+    HRESULT_OK = 0
+
+    def _guid(s):
+        g = GUID()
+        ole32.CLSIDFromString(s, ctypes.byref(g))
+        return g
+
+    def _vfn(ptr, index, restype, argtypes):
+        vtbl = ctypes.cast(
+            ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+        return proto(vtbl[index])
+
+    try:
+        try:
+            ole32.CoInitialize(None)
+        except OSError:
+            pass
+        clsid = _guid("{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}")
+        iid = _guid("{d57c7288-d4ad-4768-be02-9d969532d960}")
+        pfd = ctypes.c_void_p()
+        ole32.CoCreateInstance(ctypes.byref(clsid), None, 1,
+                               ctypes.byref(iid), ctypes.byref(pfd))
+        if not pfd:
+            return None
+        try:
+            set_options = _vfn(pfd, 9, ctypes.c_long, [ctypes.c_ulong])
+            set_options(pfd, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                        FOS_ALLOWMULTISELECT)
+            show = _vfn(pfd, 3, ctypes.c_long, [wintypes.HWND])
+            if show(pfd, wintypes.HWND(parent_hwnd)) != HRESULT_OK:
+                return []
+            p_items = ctypes.c_void_p()
+            get_results = _vfn(pfd, 27, ctypes.c_long,
+                               [ctypes.POINTER(ctypes.c_void_p)])
+            if get_results(pfd, ctypes.byref(p_items)) != HRESULT_OK or not p_items:
+                return []
+            paths = []
+            try:
+                count = ctypes.c_ulong(0)
+                _vfn(p_items, 7, ctypes.c_long,
+                     [ctypes.POINTER(ctypes.c_ulong)])(p_items, ctypes.byref(count))
+                get_item = _vfn(p_items, 8, ctypes.c_long,
+                                [ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)])
+                for i in range(count.value):
+                    psi = ctypes.c_void_p()
+                    if get_item(p_items, i, ctypes.byref(psi)) != HRESULT_OK or not psi:
+                        continue
+                    try:
+                        psz = ctypes.c_wchar_p()
+                        get_name = _vfn(psi, 5, ctypes.c_long,
+                                        [ctypes.c_int, ctypes.POINTER(ctypes.c_wchar_p)])
+                        if get_name(psi, SIGDN_FILESYSPATH, ctypes.byref(psz)) == HRESULT_OK \
+                                and psz.value:
+                            paths.append(psz.value)
+                            ole32.CoTaskMemFree(psz)
+                    finally:
+                        _vfn(psi, 2, ctypes.c_ulong, [])(psi)
+            finally:
+                _vfn(p_items, 2, ctypes.c_ulong, [])(p_items)
+            return paths
+        finally:
+            _vfn(pfd, 2, ctypes.c_ulong, [])(pfd)
+    except Exception:
+        return None
+
+
+class _AddSourcesDialog:
+    """「添加文件 / 文件夹」对话框。
+
+    支持一次多选文件、多次选择多个文件夹；确定后把所选原始路径（文件 +
+    文件夹）交回调用方，由调用方递归搜索文件夹内的可解压文件并统一加入。
+    """
+
+    def __init__(self, parent, pattern):
+        self.pattern = pattern
+        self.result = None
+        self._items = []
+        self.top = tk.Toplevel(parent)
+        self.top.title("添加文件 / 文件夹")
+        self.top.configure(background=BG)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+
+        body = ttk.Frame(self.top, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body,
+                  text="可多选文件；文件夹支持一次框选多个。确定后程序会自动"
+                       "搜索所选文件夹内所有可解压（*zf / *cf）文件。",
+                  style="Muted.TLabel", wraplength=460).pack(anchor="w")
+
+        pick = ttk.Frame(body)
+        pick.pack(fill=tk.X, pady=(8, 6))
+        ttk.Button(pick, text="添加文件…",
+                   command=self._pick_files).pack(side=tk.LEFT)
+        ttk.Button(pick, text="添加文件夹…",
+                   command=self._pick_folder).pack(side=tk.LEFT, padx=6)
+        ttk.Button(pick, text="移除选中",
+                   command=self._remove_selected).pack(side=tk.LEFT)
+
+        card = tk.Frame(body, background=CARD, highlightthickness=1,
+                        highlightbackground=BORDER)
+        card.pack(fill=tk.BOTH, expand=True)
+        self.listbox = tk.Listbox(
+            card, font=(FONT, 9), width=66, height=12, selectmode=tk.EXTENDED,
+            activestyle="none", bg=CARD, fg=FG, relief="flat",
+            highlightthickness=0, selectbackground=SELECT_BG,
+            selectforeground=FG)
+        vs = ttk.Scrollbar(card, orient=tk.VERTICAL, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=vs.set)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
+        vs.pack(side=tk.RIGHT, fill=tk.Y)
+
+        foot = ttk.Frame(body)
+        foot.pack(fill=tk.X, pady=(8, 0))
+        self.count_lbl = ttk.Label(foot, text="已选 0 项", style="Muted.TLabel")
+        self.count_lbl.pack(side=tk.LEFT)
+        ttk.Button(foot, text="取消",
+                   command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(foot, text="确定", style="Primary.TButton",
+                   command=self._ok).pack(side=tk.RIGHT, padx=6)
+
+        self._refresh()
+        self.top.bind("<Escape>", lambda _e: self._cancel())
+        self.top.bind("<Return>", lambda _e: self._ok())
+        self.top.update_idletasks()
+        try:
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            w, h = self.top.winfo_width(), self.top.winfo_height()
+            self.top.geometry("+%d+%d" % (px + (pw - w) // 2, py + (ph - h) // 2))
+        except Exception:
+            pass
+
+    def _refresh(self):
+        self.listbox.delete(0, tk.END)
+        for p in self._items:
+            tag = "[文件夹] " if os.path.isdir(p) else "[文件]   "
+            self.listbox.insert(tk.END, tag + p)
+        self.count_lbl.config(text=f"已选 {len(self._items)} 项")
+
+    def _pick_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.top, title="选择招标文件",
+            filetypes=[("招标文件 (*zf/*cf)", self.pattern), ("所有文件", "*.*")])
+        for p in paths:
+            if p not in self._items:
+                self._items.append(p)
+        self._refresh()
+
+    def _pick_folder(self):
+        # 优先使用 Windows 原生多选文件夹对话框；不可用时回退单目录选择
+        folders = _pick_folders_multi(self.top.winfo_id())
+        if folders is None:
+            folder = filedialog.askdirectory(
+                parent=self.top, title="选择文件夹")
+            folders = [folder] if folder else []
+        for folder in folders:
+            if folder and folder not in self._items:
+                self._items.append(folder)
+        self._refresh()
+
+    def _remove_selected(self):
+        sel = list(self.listbox.curselection())
+        for idx in reversed(sel):
+            del self._items[idx]
+        self._refresh()
+
+    def _ok(self):
+        self.result = list(self._items)
+        self.top.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.top.destroy()
+
+
 class ExtractTool:
     def __init__(self):
         self.root = make_root()
@@ -1946,15 +2202,15 @@ class ExtractTool:
 
         # 空列表提示（覆盖在列表中央）
         self.hint_label = tk.Label(
-            list_content, text="把 *zf / *cf 文件拖到这里\n或点击下方「选择文件」",
+            list_content, text="把 *zf / *cf 文件或文件夹拖到这里\n或点击下方「添加文件 / 文件夹」",
             bg=CARD, fg=MUTED, font=(FONT, 10), justify="center")
         self.hint_label.place(relx=0.5, rely=0.42, anchor="center")
 
         # ---- 操作按钮行 1：文件管理 ----
         ops = ttk.Frame(left_col)
         ops.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(ops, text="选择文件", command=self._add_files).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(ops, text="选择文件夹", command=self._add_folder).pack(side=tk.LEFT, padx=6)
+        ttk.Button(ops, text="添加文件 / 文件夹",
+                   command=self._add_sources).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(ops, text="移除选中", command=self._remove_selected).pack(side=tk.LEFT, padx=6)
         ttk.Button(ops, text="清空列表", command=self._clear_list).pack(side=tk.LEFT, padx=6)
 
@@ -1985,7 +2241,7 @@ class ExtractTool:
         self.attach_count = ttk.Label(attach_row, text="（0）", style="Muted.TLabel")
         self.attach_count.pack(side=tk.LEFT, padx=4)
         ttk.Button(attach_row, text="全部下载",
-                   command=self._download_all_in_motrix).pack(side=tk.RIGHT, padx=2)
+                   command=self._download_all).pack(side=tk.RIGHT, padx=2)
         attach_container = tk.Frame(self.attach_card, background=CARD)
         attach_container.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 6))
         self.attach_canvas = tk.Canvas(attach_container, bg=CARD, highlightthickness=0)
@@ -2157,7 +2413,7 @@ class ExtractTool:
     def _clear_log(self):
         self.log_text.delete(1.0, tk.END)
 
-    # ---- 附件下载面板（Motrix 无头下载：逐行进度 + 暂停/停止/重下/浏览器）----
+    # ---- 附件下载面板（内置 aria2 无头下载：逐行进度 + 暂停/停止/重下/浏览器）----
     def _populate_attachments(self):
         for w in self.attach_inner.winfo_children():
             w.destroy()
@@ -2182,8 +2438,8 @@ class ExtractTool:
         self.attach_hint.pack_forget()
         self.attach_card.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         self._ui_log(f"📎 解压识别出 {len(self.attachments)} 个可下载附件——"
-                     "点行内「下载」或「全部下载」即无头提交 Motrix（不弹窗、"
-                     "自动开始，文件存入各项目输出目录）；Motrix 未运行会自动启动")
+                     "点行内「下载」或「全部下载」即无头提交内置下载引擎（不弹窗、"
+                     "自动开始，文件存入各项目输出目录）；引擎未运行会自动启动")
 
     def _build_attach_row(self, idx):
         a = self.attachments[idx]
@@ -2219,7 +2475,7 @@ class ExtractTool:
         row["bar"].configure(value=pct)
         row["pct_lbl"].configure(text=f"{pct:.0f}%" if pct > 0 else "")
         st = row["state"]
-        defaults = {"idle": "未下载", "starting": "连接 Motrix 引擎…",
+        defaults = {"idle": "未下载", "starting": "启动下载引擎…",
                     "stopping": "处理中…", "active": "下载中…", "paused": "已暂停",
                     "waiting": "排队中…", "complete": "✔ 已完成",
                     "stopped": "已停止", "error": row.get("error") or "下载失败"}
@@ -2350,8 +2606,8 @@ class ExtractTool:
         row["speed"] = 0
         row["total"] = 0
         row["done"] = 0
-        self._set_attach_state(idx, "starting", text="连接 Motrix 引擎…")
-        self._ui_log(f"📤 提交 Motrix 下载: [{a.get('project')} | {a['category']}] {a['name']}")
+        self._set_attach_state(idx, "starting", text="启动下载引擎…")
+        self._ui_log(f"📤 提交下载: [{a.get('project')} | {a['category']}] {a['name']}")
 
         def work():
             try:
@@ -2363,7 +2619,7 @@ class ExtractTool:
                                     "text": f"解析失败: {e}"}))
                 return
             try:
-                gid = _motrix_add_download(
+                gid = _aria2_add_download(
                     real_url, a.get("out_dir") or ".",
                     _safe_filename(a["name"]) or "attachment.bin",
                     log=lambda m: self.attach_q.put(("log", idx, {"text": m})),
@@ -2381,12 +2637,12 @@ class ExtractTool:
         row = self.attach_rows.get(idx)
         if not row or not row.get("gid"):
             return
-        endpoint = _motrix_rpc_endpoint()
+        endpoint = _aria2_rpc_endpoint()
         gid = row["gid"]
         if not endpoint:
             self.attach_q.put(("state", idx,
-                               {"state": "error", "detail": "未找到 Motrix 配置",
-                                "text": "操作失败: 未找到 Motrix 配置"}))
+                               {"state": "error", "detail": "下载引擎未就绪",
+                                "text": "操作失败: 下载引擎未就绪"}))
             return
         port, secret = endpoint
 
@@ -2395,7 +2651,7 @@ class ExtractTool:
                 _aria2_rpc(port, secret, "aria2." + method, [gid], timeout=6)
             except Exception as e:
                 # 失败不硬切状态：轮询会按引擎真实状态纠正（任务可能刚完成）
-                self.attach_q.put(("log", idx, {"text": f"⚠ Motrix 操作({method})失败: {e}"}))
+                self.attach_q.put(("log", idx, {"text": f"⚠ 下载引擎操作({method})失败: {e}"}))
                 return
             self.attach_q.put(("state", idx,
                                {"state": ok_state, "text": ok_text or ""}))
@@ -2429,7 +2685,7 @@ class ExtractTool:
         if not row:
             return
         old_gid = row.get("gid")
-        endpoint = _motrix_rpc_endpoint()
+        endpoint = _aria2_rpc_endpoint()
         if old_gid and endpoint:
             port, secret = endpoint
 
@@ -2451,7 +2707,7 @@ class ExtractTool:
         except Exception as e:
             self._ui_log(f"✗ 打开失败: {e}")
 
-    def _download_all_in_motrix(self):
+    def _download_all(self):
         started = 0
         for idx in list(self.attach_rows.keys()):
             if self.attach_rows[idx]["state"] in ("idle", "error", "stopped", "complete"):
@@ -2471,7 +2727,7 @@ class ExtractTool:
             w.yview_scroll(-1 * (event.delta // 120), "units")
 
     def _attach_poller_loop(self):
-        """后台轮询 Motrix 任务状态（1 秒节拍），经 attach_q 交 UI 线程刷新。"""
+        """后台轮询下载任务状态（1 秒节拍），经 attach_q 交 UI 线程刷新。"""
         import time
         while True:
             try:
@@ -2479,23 +2735,23 @@ class ExtractTool:
                            if r.get("gid") and r["state"] in
                            ("active", "paused", "waiting", "stopping")]
                 if tracked:
-                    endpoint = _motrix_rpc_endpoint()
+                    endpoint = _aria2_rpc_endpoint()
                     if not endpoint:
                         for idx, _r in tracked:
                             self.attach_q.put(("state", idx,
                                                {"state": "error",
-                                                "detail": "未找到 Motrix 配置",
-                                                "text": "未找到 Motrix 配置"}))
+                                                "detail": "下载引擎未就绪",
+                                                "text": "下载引擎未就绪"}))
                     else:
                         port, secret = endpoint
                         for idx, _r in tracked:
                             try:
-                                st = _motrix_task_status(port, secret, _r["gid"])
+                                st = _aria2_task_status(port, secret, _r["gid"])
                             except Exception as e:
                                 msg = str(e)
                                 if "is not found" in msg:
-                                    # 任务记录被 Motrix 清除（SQLite 持久化模式下
-                                    # 完成任务即刻移出 RPC；或引擎已重启）——
+                                    # 任务记录被引擎清除（完成任务或
+                                    # 引擎重启时即消失）——
                                     # 交 UI 按目标文件是否落盘判定完成/丢失
                                     self.attach_q.put(("gone", idx, {}))
                                 else:
@@ -2508,7 +2764,7 @@ class ExtractTool:
             time.sleep(1.0)
 
     def _apply_attach_gone(self, idx):
-        """GID 在引擎中消失（Motrix SQLite 模式下完成任务/出错任务会被
+        """GID 在引擎中消失（完成任务/出错任务会被
         移出 RPC，或引擎重启）：按目标文件落盘大小判定完成/中断/丢失。"""
         row = self.attach_rows.get(idx)
         if not row or row["state"] not in ("active", "waiting", "stopping"):
@@ -2529,7 +2785,7 @@ class ExtractTool:
         else:
             row["state"] = "error"
             row["gid"] = None
-            row["error"] = "任务记录已清除（Motrix 可能已重启），请重新下载"
+            row["error"] = "任务记录已清除（引擎可能已重启），请重新下载"
             row["status_text"] = ""
         self._render_attach_row(idx)
 
@@ -2563,28 +2819,29 @@ class ExtractTool:
             except Exception as e:
                 self._ui_log(f"打开文件夹失败: {e}")
 
-    def _add_files(self):
+    def _file_pattern(self):
         exts = _get_format_extensions(self.learned)
         # 精确列出已知格式；*zf/*cf 通配兜底任意字母/数字前缀（注意：Windows 的 *.zf
         # 匹配不到 .aqzf 这类带中间点的扩展名，因此必须用无点通配 *zf / *cf）
-        pattern = ";".join(f"*.{e}" for e in exts) + ";*zf;*cf"
-        paths = filedialog.askopenfilenames(
-            title="选择招标文件",
-            filetypes=[("招标文件 (*zf/*cf)", pattern), ("所有文件", "*.*")],
-        )
-        for p in paths:
-            self._add_path(p)
-        self.status_text.set(f"已添加 {len(self.files)} 个文件")
+        return ";".join(f"*.{e}" for e in exts) + ";*zf;*cf"
 
-    def _add_folder(self):
-        folder = filedialog.askdirectory(title="选择存放招标文件的文件夹")
-        if not folder:
+    def _add_sources(self):
+        """合并的添加入口：可多选文件、可多次选择多个文件夹；文件夹内的
+        可解压文件由程序递归搜索后统一加入列表（自动去重）。"""
+        dlg = _AddSourcesDialog(self.root, self._file_pattern())
+        self.root.wait_window(dlg.top)
+        if not dlg.result:
             return
-        count = 0
-        for fp in _collect_cli_files([folder]):
-            self._add_path(fp)
-            count += 1
-        self.status_text.set(f"已添加 {count} 个文件")
+        added = 0
+        for p in _collect_cli_files(dlg.result, recursive=True):
+            if p not in self.files:
+                self._add_path(p)
+                added += 1
+        n_folder = sum(1 for x in dlg.result if os.path.isdir(x))
+        msg = f"已添加 {added} 个文件"
+        if n_folder:
+            msg += f"（含 {n_folder} 个文件夹内搜索结果）"
+        self.status_text.set(msg)
 
     def _remove_selected(self):
         sel = list(self.file_listbox.curselection())
@@ -2704,7 +2961,7 @@ class ExtractTool:
             if self.attachments:
                 parts.append(f"识别到 {len(self.attachments)} 个可下载附件，"
                              + "已列在右侧「可下载附件」栏，点行内「下载」"
-                               "或「全部下载」无头提交 Motrix")
+                               "或「全部下载」无头提交内置下载引擎")
             if self.last_output_dir:
                 parts.append(f"输出目录:\n{self.last_output_dir}")
             messagebox.showinfo("解压完成", "\n".join(parts))

@@ -15,6 +15,8 @@ _SHA256SUMS.txt
 
 # Binaries
 *.exe
+# 内置下载引擎（需随仓库分发以便打包内嵌，故不忽略）
+!aria2c.exe
 
 # Virtual environments
 .venv/
