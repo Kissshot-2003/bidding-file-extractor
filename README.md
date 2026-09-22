@@ -76,6 +76,13 @@ pyinstaller --noconfirm --clean 招标文件快速解压工具_v3.3.spec
 
 ## 许可
 
-[MIT](LICENSE)
+本项目**主程序**以 [MIT](LICENSE) 许可发布。
+
+> **第三方组件合规**：为提供内置附件下载能力，本仓库随包分发第三方程序
+> **aria2c.exe**（aria2 1.37.0，**GPL-2.0**）。它以独立可执行文件形式**聚合分发**，
+> 不是本项目的衍生作品，故本项目主体仍为 MIT；aria2c.exe 单独受 GPL-2.0 约束。
+> 二次分发时请一并保留 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、
+> `aria2_COPYING.txt` 与 `aria2_LICENSE.OpenSSL.txt`，并保留 aria2 源码获取途径
+> （https://github.com/aria2/aria2 ）。详见第三方声明。
 
 > 免责声明：本工具仅供辅助整理招标文件使用，不涉及任何平台破解或不可信获取，请在法律范围内使用。

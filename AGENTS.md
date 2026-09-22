@@ -14,6 +14,9 @@
 - 发版前必须全量跑通：`python -X utf8 -m unittest test_extract_tool -v`。
 
 ## 项目要点
+- 开源合规：主程序 MIT；内嵌 aria2c.exe 为 GPL-2.0，以独立可执行文件「聚合分发」，
+  不是衍生作品。再分发（含打包 exe）必须随附 THIRD_PARTY_NOTICES.md、aria2_COPYING.txt、
+  aria2_LICENSE.OpenSSL.txt，并保留 aria2 源码获取途径（release-1.37.0）。
 - 附件下载用随包内嵌的 aria2c.exe（binaries 内嵌；运行期经 sys._MEIPASS/程序目录定位）。
   程序自行拉起 aria2 引擎（随机空闲端口 + 随机 rpc-secret）并经本地 JSON-RPC 控制，
   不再依赖 Motrix；源码运行需项目根存在 aria2c.exe；退出时 atexit 关闭引擎。
